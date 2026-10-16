@@ -10,14 +10,16 @@
 win=$1 client=$2 name=$3
 [ -n "$name" ] || exit 0
 
-if tmux has-session -t "=$name" 2>/dev/null; then
-  dest=$(tmux display-message -p -t "=$name" '#{session_id}')
+# tmux rewrites "." and ":" in session names, so match on the stored name, not -t.
+dest=$(tmux list-sessions -F '#{session_id}' -f "#{==:#{session_name},$name}")
+if [ -n "$dest" ]; then
   placeholder=
 else
   # new-session needs a first window; it is swapped out for the real one below.
   read -r dest placeholder < <(tmux new-session -d -P -F '#{session_id} #{window_id}' -s "$name")
 fi
 
+[ -n "$dest" ] || exit 1
 tmux switch-client -c "$client" -t "$dest"
 tmux move-window -d -s "$win" -t "$dest:"
 tmux select-window -t "$win"

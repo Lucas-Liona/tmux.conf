@@ -11,7 +11,7 @@
 # The last check is for repeat bindings (C-a C-h h h): they leave the client in
 # the prefix table but always move or resize something.
 #
-#   which-key.sh --menu   the popup itself: prints the chosen key, or nothing
+#   which-key.sh --menu <rows>   the popup itself: prints the chosen key, or nothing
 #   which-key.sh --rank <rows> <query>   the menu rows, keys matching the query first
 set -euo pipefail
 
@@ -33,10 +33,19 @@ if [ "${1:-}" = --rank ]; then
 fi
 
 if [ "${1:-}" = --menu ]; then
-    rows=$(mktemp)
-    trap 'rm -f "$rows"' EXIT
-    # list-keys gives the command in config syntax, list-keys -N tmux's own
-    # description where the binding has one (most defaults do, ours mostly not).
+    rows=$2
+    fzf --delimiter=$'\t' --with-nth=2 --tiebreak=index < "$rows" \
+          --bind "change:reload(~/.config/tmux/scripts/which-key.sh --rank '$rows' {q})" \
+          --height=100% --reverse --prompt="C-a > " \
+          --header=$'type to filter · enter runs it · esc closes  (r = repeatable)' \
+      | cut -f1 || true
+    exit 0
+fi
+
+# One row per prefix binding: the key in config syntax, a tab, then what shows.
+# list-keys gives the command, list-keys -N tmux's own description where the
+# binding has one (most defaults do, ours have -N notes in tmux.conf).
+build_rows() {
     { tmux list-keys -T prefix; echo; tmux list-keys -N -T prefix; } | python3 -c '
 import re, sys
 
@@ -71,28 +80,32 @@ for token, key, repeat, cmd in sorted(rows, key=lambda row: order(row[1])):
     what = notes.get(key) or cmd
     r = "r" if repeat else " "
     print(f"{token}\t{key:<8} {r}  {what[:110]}")
-' > "$rows"
-    fzf --delimiter=$'\t' --with-nth=2 --tiebreak=index < "$rows" \
-          --bind "change:reload(~/.config/tmux/scripts/which-key.sh --rank '$rows' {q})" \
-          --height=100% --reverse --prompt="C-a > " \
-          --header=$'type to filter · enter runs it · esc closes  (r = repeatable)' \
-      | cut -f1 || true
-    exit 0
-fi
+'
+}
 
 client=$1 press=$2 before=$3
-delay=0.5
+# The job starts ~0.1 s after the press (measured on this machine), so 0.4
+# puts the popup near the half second nvim's which-key uses.
+delay=0.4
 state='#{window_id} #{pane_id} #{window_layout}'
 
+# Build the rows while waiting, so the popup shows its frame and its text
+# together and still opens on time. Wasted on a fast key, but it is ~30 ms.
+rows=$(mktemp) pick=$(mktemp)
+trap 'rm -f "$rows" "$pick"' EXIT
+build_rows > "$rows" &
 sleep "$delay"
+wait
 [ "$(tmux show-option -gqv @wk_n)" = "$press" ] || exit 0
-[ "$(tmux display-message -p -c "$client" '#{client_key_table}')" = prefix ] || exit 0
-[ "$(tmux display-message -p -c "$client" "$state")" = "$before" ] || exit 0
+# list-clients, not display-message -c: from a background job, display-message
+# fills client fields from the most recently active client, which need not be
+# the one that pressed C-a.
+now=$(tmux list-clients -F "#{client_name}|#{client_key_table}|$state" | awk -F'|' -v c="$client" '$1 == c')
+[ "$(cut -d'|' -f2 <<<"$now")" = prefix ] || exit 0
+[ "$(cut -d'|' -f3- <<<"$now")" = "$before" ] || exit 0
 
-pick=$(mktemp)
-trap 'rm -f "$pick"' EXIT
 tmux display-popup -c "$client" -x C -y S -w 90% -h 45% \
-    -E "~/.config/tmux/scripts/which-key.sh --menu > '$pick'" || true
+    -E "~/.config/tmux/scripts/which-key.sh --menu '$rows' > '$pick'" || true
 key=$(cat "$pick")
 
 if [ -z "$key" ]; then

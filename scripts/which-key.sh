@@ -12,9 +12,29 @@
 # the prefix table but always move or resize something.
 #
 #   which-key.sh --menu   the popup itself: prints the chosen key, or nothing
+#   which-key.sh --rank <rows> <query>   the menu rows, keys matching the query first
 set -euo pipefail
 
+if [ "${1:-}" = --rank ]; then
+    # fzf scores "g" in "Agent jump" as high as the key g itself, so every
+    # keystroke reloads the rows with the typed key on top: exact key, then keys
+    # starting with the query, then the rest. fzf still filters and ranks by
+    # match quality; --tiebreak=index makes this order win the ties.
+    awk -F'\t' -v q="$3" '
+        { split($2, f, " "); key = f[1] }
+        q == ""                { print; next }
+        key == q               { exact[++e] = $0; next }
+        index(key, q) == 1     { prefix[++p] = $0; next }
+                               { rest[++r] = $0 }
+        END { for (i = 1; i <= e; i++) print exact[i]
+              for (i = 1; i <= p; i++) print prefix[i]
+              for (i = 1; i <= r; i++) print rest[i] }' "$2"
+    exit 0
+fi
+
 if [ "${1:-}" = --menu ]; then
+    rows=$(mktemp)
+    trap 'rm -f "$rows"' EXIT
     # list-keys gives the command in config syntax, list-keys -N tmux's own
     # description where the binding has one (most defaults do, ours mostly not).
     { tmux list-keys -T prefix; echo; tmux list-keys -N -T prefix; } | python3 -c '
@@ -51,7 +71,9 @@ for token, key, repeat, cmd in sorted(rows, key=lambda row: order(row[1])):
     what = notes.get(key) or cmd
     r = "r" if repeat else " "
     print(f"{token}\t{key:<8} {r}  {what[:110]}")
-' | fzf --delimiter=$'\t' --with-nth=2 --no-sort \
+' > "$rows"
+    fzf --delimiter=$'\t' --with-nth=2 --tiebreak=index < "$rows" \
+          --bind "change:reload(~/.config/tmux/scripts/which-key.sh --rank '$rows' {q})" \
           --height=100% --reverse --prompt="C-a > " \
           --header=$'type to filter · enter runs it · esc closes  (r = repeatable)' \
       | cut -f1 || true

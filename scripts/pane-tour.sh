@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Show a list of panes one by one on Lucas's terminal, and kill them if asked.
-#   pane-tour.sh <idfile> [--kill] [--dwell 0.75] [--client NAME]
+#   pane-tour.sh <idfile|-> [--kill | --instant] [--dwell 0.75] [--client NAME]
+#
+# --instant kills without the tour: no switching, painting or waiting, the
+# same checks at kill time (and still nothing in a window with claude/codex,
+# whose pane would be widened into the freed space).
 #
 # For each pane id in <idfile> (one per line, e.g. %15): switch the client to
 # its window, select it, paint it red, and say "32/131 chezmoi:2.4 idle zsh
@@ -25,19 +29,70 @@
 # refuses to guess when there are several.
 set -euo pipefail
 
-idfile="" kill=0 dwell=0.75 client=""
+idfile="" kill=0 instant=0 dwell=0.75 client=""
 while [ $# -gt 0 ]; do
     case $1 in
         --kill) kill=1 ;;
+        --instant) kill=1 instant=1 ;;
         --dwell) dwell=$2; shift ;;
         --client) client=$2; shift ;;
+        -) idfile=/dev/stdin ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) idfile=$1 ;;
     esac
     shift
 done
-[ -r "$idfile" ] || { echo "usage: pane-tour.sh <idfile> [--kill] [--dwell 0.75] [--client NAME]" >&2; exit 2; }
+[ -r "$idfile" ] || { echo "usage: pane-tour.sh <idfile|-> [--kill | --instant] [--dwell 0.75] [--client NAME]" >&2; exit 2; }
 mapfile -t ids < <(grep -o '%[0-9]*' "$idfile")  # tolerates a missing final newline
+
+# display-message -p -t on a pane that is gone still exits 0 (empty fields), so
+# existence is a list-panes question.
+exists() { grep -qxF "$1" <<<"$(tmux list-panes -a -F '#{pane_id}')"; }
+children() { cat "/proc/$1/task/$1/children" 2>/dev/null; }
+total=${#ids[@]} shown=0 killed=0 gone=0 stopped=""
+declare -A skipped_claude=() skipped_viewed=() skipped_width=()
+refused=()
+
+# Kill a listed pane only if it is, right now, still a bare idle shell with no
+# children and not the last non-sidebar pane of its window: the list can be
+# hours old and a pane can come back to life.
+try_kill() {  # pane window where
+    local cmd pid real
+    IFS='|' read -r cmd pid <<<"$(tmux display-message -p -t "$1" '#{pane_current_command}|#{pane_pid}')"
+    real=$(tmux list-panes -t "$2" -F '#{@workmux_role}' | grep -cvx sidebar || true)
+    if ! exists "$1"; then gone=$((gone + 1))
+    elif [ "$cmd" != zsh ] && [ "$cmd" != bash ]; then refused+=("$3: runs $cmd")
+    elif [ -n "$(children "$pid")" ]; then refused+=("$3: has a child process")
+    elif [ "$real" -le 1 ]; then refused+=("$3: last real pane in its window")
+    else tmux kill-pane -t "$1"; killed=$((killed + 1))
+    fi
+}
+in_agent_window() {  # window -- captured first: grep -q exiting early can SIGPIPE
+    local commands       # list-panes, and under pipefail that reads as "no claude here"
+    commands=$(tmux list-panes -t "$1" -F '#{pane_current_command}')
+    grep -qxE 'claude|codex' <<<"$commands"
+}
+report() {
+    if [ "$instant" = 1 ]; then echo "pane-tour --instant: killed $killed of $total, gone $gone"
+    else echo "pane-tour: shown $shown of $total$([ "$kill" = 1 ] && echo ", killed $killed"), gone $gone"; fi
+    [ -n "$stopped" ] && echo "stopped by a key at $stopped"
+    [ ${#refused[@]} -gt 0 ] && printf 'refused: %s\n' "${refused[@]}"
+    [ ${#skipped_claude[@]} -gt 0 ] && echo "skipped, a window with claude/codex: ${!skipped_claude[*]}"
+    [ ${#skipped_viewed[@]} -gt 0 ] && echo "skipped, another client is viewing: ${!skipped_viewed[*]}"
+    [ ${#skipped_width[@]} -gt 0 ] && echo "skipped, would resize a claude window in the session: ${!skipped_width[*]}"
+    true
+}
+
+if [ "$instant" = 1 ]; then
+    for pane in "${ids[@]}"; do
+        exists "$pane" || { gone=$((gone + 1)); continue; }
+        IFS='|' read -r window where <<<"$(tmux display-message -p -t "$pane" '#{window_id}|#{session_name}:#{window_index}.#{pane_index}')"
+        if in_agent_window "$window"; then skipped_claude[${where%.*}]=1; continue; fi
+        try_kill "$pane" "$window" "$where"
+    done
+    report
+    exit 0
+fi
 
 if [ -z "$client" ]; then
     mapfile -t terminals < <(tmux list-clients -F '#{client_name} #{client_control_mode}' | awk '$2 == 0 {print $1}')
@@ -50,9 +105,6 @@ fi
 client_field() {  # list-clients, not display -c: the latter reads the most recent client
     tmux list-clients -F "#{client_name}|$1" | awk -F'|' -v c="$client" '$1 == c {print $2}'
 }
-# display-message -p -t on a pane that is gone still exits 0 (empty fields), so
-# existence is a list-panes question.
-exists() { grep -qxF "$1" <<<"$(tmux list-panes -a -F '#{pane_id}')"; }
 home=$(client_field '#{pane_id}')
 [ -n "$home" ] || { echo "no client named $client" >&2; exit 2; }
 
@@ -93,14 +145,9 @@ trap 'exit 130' INT TERM HUP
 tmux set-option -gu @pane_tour_stop
 tmux bind-key -T pane-tour Any if -F '#{!=:#{mouse_x},}' 'switch-client -T pane-tour' 'set-option -g @pane_tour_stop 1'
 
-children() { cat "/proc/$1/task/$1/children" 2>/dev/null; }
 width=$(client_field '#{client_width}')
 others=$(tmux list-clients -F '#{client_name}|#{session_id}' | awk -F'|' -v c="$client" '$1 != c {print $2}' | sort -u)
 dwell_ms=$(awk -v d="$dwell" 'BEGIN {printf "%d", d * 1000}')
-total=${#ids[@]} shown=0 killed=0 gone=0 stopped=""
-declare -A skipped_claude=() skipped_viewed=() skipped_width=()
-refused=()
-
 for i in "${!ids[@]}"; do
     pane=${ids[$i]} n=$((i + 1))
     exists "$pane" || { gone=$((gone + 1)); continue; }
@@ -108,10 +155,7 @@ for i in "${!ids[@]}"; do
         '#{session_id}|#{window_id}|#{session_name}:#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}')
     IFS='|' read -r session window where cmd path pid <<<"$info"
     wname=${where%.*}
-    # Captured first: grep -q exiting early can SIGPIPE list-panes, and under
-    # pipefail that would read as "no claude here".
-    commands=$(tmux list-panes -t "$window" -F '#{pane_current_command}')
-    if grep -qxE 'claude|codex' <<<"$commands"; then
+    if in_agent_window "$window"; then
         skipped_claude[$wname]=1; continue
     fi
     if grep -qxF "$session" <<<"$others"; then
@@ -140,26 +184,8 @@ for i in "${!ids[@]}"; do
     tmux set-option -p -u -t "$pane" window-style
     tmux set-option -p -u -t "$pane" window-active-style
 
-    if [ "$kill" = 1 ]; then
-        # Check again now: the list is hours old and a pane can come back to life.
-        IFS='|' read -r cmd pid <<<"$(tmux display-message -p -t "$pane" '#{pane_current_command}|#{pane_pid}')"
-        real=$(tmux list-panes -t "$window" -F '#{@workmux_role}' | grep -cvx sidebar || true)
-        if ! exists "$pane"; then gone=$((gone + 1))
-        elif [ "$cmd" != zsh ] && [ "$cmd" != bash ]; then refused+=("$where: runs $cmd")
-        elif [ -n "$(children "$pid")" ]; then refused+=("$where: has a child process")
-        elif [ "$real" -le 1 ]; then refused+=("$where: last real pane in its window")
-        else tmux kill-pane -t "$pane"; killed=$((killed + 1))
-        fi
-    fi
+    [ "$kill" = 1 ] && try_kill "$pane" "$window" "$where"
 done
 
-{
-    echo "pane-tour: shown $shown of $total$([ "$kill" = 1 ] && echo ", killed $killed"), gone $gone"
-    [ -n "$stopped" ] && echo "stopped by a key at $stopped"
-    [ ${#refused[@]} -gt 0 ] && printf 'refused: %s\n' "${refused[@]}"
-    [ ${#skipped_claude[@]} -gt 0 ] && echo "skipped, a window with claude/codex: ${!skipped_claude[*]}"
-    [ ${#skipped_viewed[@]} -gt 0 ] && echo "skipped, another client is viewing: ${!skipped_viewed[*]}"
-    [ ${#skipped_width[@]} -gt 0 ] && echo "skipped, would resize a claude window in the session: ${!skipped_width[*]}"
-    true
-} | tee "$snap/report"
+report | tee "$snap/report"
 tmux display-message -c "$client" -d 4000 "$(head -1 "$snap/report")"

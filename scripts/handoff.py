@@ -239,8 +239,9 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     aborted = ["tmux", "display-message", "-c", client, "-d", "8000", "handoff: :cq, nothing launched"]
     run = (f"if {shlex.join(edit)}; then {shlex.join([sys.executable, __file__, '--launch', str(buffer)])}; "
            f"else {shlex.join(aborted)}; fi")
+    # -EE: the popup closes only on success, so a failed launch or a traceback stays readable.
     tmux("display-popup", "-c", client, "-w", "80%", "-h", "60%", "-d", pane_path,
-         "-T", " handoff: :wq launches, :cq aborts ", "-E", run)
+         "-T", " handoff: :wq launches, :cq aborts ", "-EE", run)
 
 
 def parse_buffer(text):
@@ -288,8 +289,13 @@ def launch(buffer):
     # claude runs as the window's command, not typed into a shell; a shell takes over when it exits so the
     # window stays. Its bin dir goes on PATH for what claude starts itself (npx MCP servers, node).
     env_path = f"{Path(claude).parent}:{os.environ.get('PATH', '')}"
-    tmux("new-window", "-t", ctx["session"], "-c", ctx["dir"], "-e", f"PATH={env_path}",
-         "zsh", "-c", '"$0" "$@"; exec zsh', *argv)
+    made = subprocess.run(["tmux", "new-window", "-t", ctx["session"], "-c", ctx["dir"], "-e", f"PATH={env_path}",
+                           "zsh", "-c", '"$0" "$@"; exec zsh', *argv], capture_output=True, text=True)
+    if made.returncode:  # printed too: the popup (-EE) stays open on a non-zero exit
+        why = made.stderr.strip() or f"tmux new-window exited {made.returncode}"
+        print(f"handoff: not launched; {why}")
+        tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched; {why}")
+        sys.exit(1)
 
     if fields["old"] == "close" and ctx.get("old_pid"):
         close_old(ctx["old_pid"], ctx["client"])

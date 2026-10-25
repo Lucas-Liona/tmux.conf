@@ -5,12 +5,15 @@
     skill-badge add <pane> <skill>                       one more, if it is new
     skill-badge clear <pane>
     skill-badge hook                                     Claude Code hook; reads the event on stdin
+    skill-badge show <pane>                              the full status, for prefix+B's popup
     skill-badge on | off | toggle                        draw the badges as a top border line, or not
 
 The data is three pane options: @skills (load order), @preset, and @skill_badge, the text drawn:
-the preset, else the first skill, then +N for the rest. tmux.conf's pane-border-format draws it.
-A border line is a window option and takes a row from every pane in its window, so `on` turns it
-on only in windows that have a badge, and `off` gives those rows back.
+the preset, else the first skill, then +N for the rest. tmux.conf sends the focused pane's
+@skill_badge as the terminal title, which WezTerm draws top right of its window.
+The border line is the per-pane prototype, off unless asked for. It is a window option and takes
+a row from every pane in its window, so `on` turns it on only in windows that have a badge, and
+`off` gives those rows back.
 
 As a hook it handles PostToolUse on the Skill tool, UserPromptExpansion (a typed /skill never
 calls the tool) and SessionEnd (clear). It finds its pane through TMUX_PANE, does nothing outside
@@ -18,8 +21,15 @@ tmux, and never fails: a hook error would land in Claude's transcript.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
+import termios
+import tty
+from pathlib import Path
+
+SKILLS = Path.home() / ".claude/skills"
+PLUGINS = Path.home() / ".claude/plugins"
 
 
 def tmux(*args: str) -> str:
@@ -39,7 +49,7 @@ def badged_windows() -> set[str]:
     return {window for window, _, badge in rows if badge}
 
 
-def show(window: str) -> None:
+def border(window: str) -> None:
     """Border line on if a pane here has a badge; off again, if we turned it on, once none has."""
     if window in badged_windows():
         tmux("set-option", "-w", "-t", window, "pane-border-status", "top")
@@ -60,7 +70,7 @@ def write(pane: str, skills: list[str], preset: str) -> None:
             tmux("set-option", "-pu", "-t", pane, name)
     window = tmux("display-message", "-p", "-t", pane, "#{window_id}").strip()  # empty for a gone pane
     if window and badges_on():
-        show(window)
+        border(window)
 
 
 def add(pane: str, skill: str) -> None:
@@ -86,11 +96,59 @@ def hook() -> None:
         write(pane, [], "")
 
 
+def skill_file(name: str) -> tuple[str, Path | None]:
+    """(source, SKILL.md) for a personal skill or a plugin's "plugin:skill"."""
+    if ":" not in name:
+        path = SKILLS / name / "SKILL.md"
+        return "personal", path if path.exists() else None
+    plugin, skill = name.split(":", 1)
+    found = sorted(PLUGINS.glob(f"**/{plugin}/**/skills/{skill}/SKILL.md"))
+    return f"plugin {plugin}", found[-1] if found else None
+
+
+def description(path: Path) -> str:
+    """The frontmatter description, folded (`>-`) or not, as one line."""
+    lines = path.read_text(errors="replace").split("\n")
+    end = lines.index("---", 1) if lines[:1] == ["---"] and "---" in lines[1:] else 0
+    for i, line in enumerate(lines[1:end], 1):
+        if line.startswith("description:"):
+            value = line.split(":", 1)[1].strip()
+            if value in (">-", ">", "|", "|-", ""):
+                value = " ".join(l.strip() for l in lines[i + 1:end] if l.startswith((" ", "\t")))
+            return value.strip("'\"")
+    return ""
+
+
+def status(pane: str) -> None:
+    where = tmux("display-message", "-p", "-t", pane, "#{session_name}:#{window_index}.#{pane_index}  #{pane_current_path}")
+    skills, preset = option(pane, "@skills").split(), option(pane, "@preset")
+    width = shutil.get_terminal_size((100, 20)).columns
+    print(f"{pane}  {where.strip()}")
+    print(f"preset  {preset or '-'}\n")
+    if not skills:
+        print("No skills recorded for this pane: none loaded since the hook went in, or not a Claude pane.")
+    for name in skills:
+        source, path = skill_file(name)
+        size = f"{len(path.read_text(errors='replace').splitlines())} lines" if path else "not found"
+        text = description(path) if path else ""
+        head = f"{name:<26} {source:<18} {size:>10}  "
+        room = max(width - len(head) - 1, 10)
+        print(head + (text if len(text) <= room else text[:room - 1] + "…"))
+    if sys.stdin.isatty():  # in the popup: stay up until a key
+        print("\nany key closes", end="", flush=True)
+        saved = termios.tcgetattr(sys.stdin)
+        try:
+            tty.setcbreak(sys.stdin)
+            sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+
+
 def turn(on: bool) -> None:
     if on:
         tmux("set-option", "-g", "@skill_badge_on", "1")
         for window in badged_windows():
-            show(window)
+            border(window)
         return
     tmux("set-option", "-gu", "@skill_badge_on")
     for line in tmux("list-windows", "-a", "-F", "#{window_id} #{@skill_badge_window}").splitlines():
@@ -115,6 +173,8 @@ def main(args: list[str]) -> int:
             add(pane, skill)
         case ["clear", pane]:
             write(pane, [], "")
+        case ["show", pane]:
+            status(pane)
         case ["on"] | ["off"]:
             turn(args[0] == "on")
         case ["toggle"]:

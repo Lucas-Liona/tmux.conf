@@ -78,6 +78,70 @@ vim.keymap.set("i", "<Tab>", function()
   return vim.api.nvim_get_current_line():match("^%w+:") and "<C-x><C-o>" or "<Tab>"
 end, { buffer = buf, expr = true })
 
+-- The note: everything under ---, the new session's first prompt. It opens as a few real blank lines
+-- with a hint drawn over them (virtual text, never written), and the cursor waits on the first one.
+local SPACE, hint_ns = 4, vim.api.nvim_create_namespace("handoff-hint")
+local HINT = {
+  "Write the new session's first prompt here.",
+  "The transcript path and the skills line go after it; left empty, it gets context only.",
+  ":wq launches · :cq aborts · Tab completes the values above",
+}
+local function divider()
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    if line == "---" then return i end
+  end
+end
+
+local function hint()
+  vim.api.nvim_buf_clear_namespace(buf, hint_ns, 0, -1)
+  local d = divider()
+  if not d then return end
+  local note = vim.api.nvim_buf_get_lines(buf, d, -1, false)
+  if table.concat(note):match("%S") then return end
+  for i = 1, math.min(#HINT, #note) do
+    vim.api.nvim_buf_set_extmark(buf, hint_ns, d + i - 1, 0,
+      { virt_text = { { HINT[i], "Comment" } }, virt_text_pos = "overlay" })
+  end
+end
+
+local d = divider()
+if d and vim.api.nvim_buf_line_count(buf) - d < SPACE then
+  vim.api.nvim_buf_set_lines(buf, -1, -1, false, vim.fn["repeat"]({ "" }, SPACE - (vim.api.nvim_buf_line_count(buf) - d)))
+  vim.bo[buf].modified = false
+end
+hint()
+vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, { buffer = buf, callback = hint })
+
+-- +$ alone is not enough: Lucas's 18:12 press opened at 1:1 with a UI attached, which no throwaway
+-- server reproduces. So the cursor is placed again once the UI is up.
+local function to_note()
+  local line = divider()
+  if line and vim.api.nvim_get_current_buf() == buf then
+    vim.api.nvim_win_set_cursor(0, { line + 1, 0 })
+    vim.cmd.startinsert()
+  end
+end
+to_note()
+vim.api.nvim_create_autocmd("UIEnter", { once = true, callback = function() vim.schedule(to_note) end })
+
+-- Until that 1:1 has a name: for 3 s, every key and any jump above the note go to <stem>.launch.keys.log,
+-- so the next time it happens it names itself (a mouse event, a terminal reply read as keys, ...).
+local started, log_ns = vim.uv.hrtime(), vim.api.nvim_create_namespace("handoff-keylog")
+local function note_down(what)
+  local ms = (vim.uv.hrtime() - started) / 1e6
+  if ms > 3000 then return end
+  vim.fn.writefile({ ("%5d ms  %s"):format(ms, what) }, (name:gsub("%.launch%.md$", ".launch.keys.log")), "a")
+end
+vim.on_key(function(_, typed) if typed ~= "" then note_down("key " .. vim.fn.keytrans(typed)) end end, log_ns)
+vim.defer_fn(function() vim.on_key(nil, log_ns) end, 3000)
+vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+  buffer = buf,
+  callback = function()
+    local row, line = vim.api.nvim_win_get_cursor(0)[1], divider()
+    if line and row <= line then note_down(("cursor to %d:%d, mode %s"):format(row, vim.fn.col("."), vim.fn.mode())) end
+  end,
+})
+
 -- :wq with an error writes nothing and stays: the buffer is left modified, so the quit is refused too.
 vim.api.nvim_create_autocmd("BufWriteCmd", {
   buffer = buf,

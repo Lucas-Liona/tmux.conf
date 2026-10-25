@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""The skill badge: which preset and skills a Claude pane has loaded, top right of the pane.
+
+    skill-badge set <pane> [--preset NAME] <skill>...   replace the pane's skills (handoff.py, at launch)
+    skill-badge add <pane> <skill>                       one more, if it is new
+    skill-badge clear <pane>
+    skill-badge hook                                     Claude Code hook; reads the event on stdin
+    skill-badge on | off | toggle                        draw the badges as a top border line, or not
+
+The data is three pane options: @skills (load order), @preset, and @skill_badge, the text drawn:
+the preset, else the first skill, then +N for the rest. tmux.conf's pane-border-format draws it.
+A border line is a window option and takes a row from every pane in its window, so `on` turns it
+on only in windows that have a badge, and `off` gives those rows back.
+
+As a hook it handles PostToolUse on the Skill tool, UserPromptExpansion (a typed /skill never
+calls the tool) and SessionEnd (clear). It finds its pane through TMUX_PANE, does nothing outside
+tmux, and never fails: a hook error would land in Claude's transcript.
+"""
+import json
+import os
+import subprocess
+import sys
+
+
+def tmux(*args: str) -> str:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True).stdout
+
+
+def option(pane: str, name: str) -> str:
+    return tmux("show-options", "-pqv", "-t", pane, name).strip()
+
+
+def badges_on() -> bool:
+    return bool(tmux("show-options", "-gqv", "@skill_badge_on").strip())
+
+
+def badged_windows() -> set[str]:
+    rows = (line.partition(" ") for line in tmux("list-panes", "-a", "-F", "#{window_id} #{@skill_badge}").splitlines())
+    return {window for window, _, badge in rows if badge}
+
+
+def show(window: str) -> None:
+    """Border line on if a pane here has a badge; off again, if we turned it on, once none has."""
+    if window in badged_windows():
+        tmux("set-option", "-w", "-t", window, "pane-border-status", "top")
+        tmux("set-option", "-w", "-t", window, "@skill_badge_window", "1")
+    elif tmux("show-options", "-wqv", "-t", window, "@skill_badge_window").strip():
+        tmux("set-option", "-wu", "-t", window, "pane-border-status")
+        tmux("set-option", "-wu", "-t", window, "@skill_badge_window")
+
+
+def write(pane: str, skills: list[str], preset: str) -> None:
+    label = preset or (skills[0] if skills else "")
+    rest = [s for s in skills if s != label]
+    badge = f"{label} +{len(rest)}" if rest else label
+    for name, value in (("@skills", " ".join(skills)), ("@preset", preset), ("@skill_badge", badge)):
+        if value:
+            tmux("set-option", "-p", "-t", pane, name, value)
+        else:
+            tmux("set-option", "-pu", "-t", pane, name)
+    window = tmux("display-message", "-p", "-t", pane, "#{window_id}").strip()  # empty for a gone pane
+    if window and badges_on():
+        show(window)
+
+
+def add(pane: str, skill: str) -> None:
+    skills = option(pane, "@skills").split()
+    if skill and skill not in skills:
+        write(pane, skills + [skill], option(pane, "@preset"))
+
+
+def hook() -> None:
+    pane = os.environ.get("TMUX_PANE")
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        return
+    if not pane:
+        return
+    kind = event.get("hook_event_name")
+    if kind == "PostToolUse" and event.get("tool_name") == "Skill":
+        add(pane, (event.get("tool_input") or {}).get("skill", ""))
+    elif kind == "UserPromptExpansion" and event.get("expansion_type") == "slash_command":
+        add(pane, event.get("command_name", ""))
+    elif kind == "SessionEnd":
+        write(pane, [], "")
+
+
+def turn(on: bool) -> None:
+    if on:
+        tmux("set-option", "-g", "@skill_badge_on", "1")
+        for window in badged_windows():
+            show(window)
+        return
+    tmux("set-option", "-gu", "@skill_badge_on")
+    for line in tmux("list-windows", "-a", "-F", "#{window_id} #{@skill_badge_window}").splitlines():
+        window, _, ours = line.partition(" ")
+        if ours:
+            tmux("set-option", "-wu", "-t", window, "pane-border-status")
+            tmux("set-option", "-wu", "-t", window, "@skill_badge_window")
+
+
+def main(args: list[str]) -> int:
+    match args:
+        case ["hook"]:
+            try:
+                hook()
+            except Exception:
+                pass
+        case ["set", pane, "--preset", preset, *skills]:
+            write(pane, skills, preset)
+        case ["set", pane, *skills]:
+            write(pane, skills, "")
+        case ["add", pane, skill]:
+            add(pane, skill)
+        case ["clear", pane]:
+            write(pane, [], "")
+        case ["on"] | ["off"]:
+            turn(args[0] == "on")
+        case ["toggle"]:
+            turn(not badges_on())
+        case _:
+            print(__doc__.split("\n\n")[1], file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

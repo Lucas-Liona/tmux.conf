@@ -10,9 +10,9 @@ pane's shell, whose ~/.claude/sessions/<pid>.json names the session id and cwd. 
 out in full to ~/.cache/handoff/, wrapped in <previous-session> so the new agent reads it as context, not
 as instructions. A pane with no Claude hands over its scrollback instead.
 
-Then a popup opens nvim on a launch buffer: model, effort, skills and a note for the new session. :wq
-launches claude in a new window with those settings and the note as its first prompt; :cq or an empty note
-opens nothing.
+Then a popup opens nvim on a launch buffer: model, effort, skills and a note for the new session, with
+completion and checks from handoff-buffer.lua. :wq launches claude in a new window with those settings and
+the note (empty is fine: context only) as its first prompt; :cq is the only way out without launching.
 """
 import importlib.util
 import json
@@ -34,12 +34,11 @@ OUT = HOME / ".cache/handoff"
 SKILLS = HOME / ".claude/skills"
 # panel.is_injected drops every line starting with "<"; these are Lucas's own: a paste, and a `!` command.
 LUCAS_TAGS = ("<pasted_content", "<bash-input", "<bash-stdout")
-CHOICES = {
-    "model": ["opus", "fable", "sonnet", "haiku"],
-    "effort": ["xhigh", "low", "medium", "high", "max"],
-    "others": ["name-only", "on", "user-invocable-only", "off"],
-    "old": ["keep", "close"],
-}
+# skillOverrides' states have no code source to read; they are the table at
+# https://code.claude.com/docs/en/skills#skilloverrides (checked 2026-10-25).
+OVERRIDE_STATES = ["name-only", "on", "user-invocable-only", "off"]
+MODELS_SKILL = SKILLS / "models/SKILL.md"
+BUFFER_LUA = Path(__file__).with_name("handoff-buffer.lua")
 # panel.py already knows which "user" lines are Lucas and which are injected reminders; reuse that, unedited.
 _loader = SourceFileLoader("panel", str(HOME / ".local/bin/panel.py"))
 panel = sys.modules["panel"] = importlib.util.module_from_spec(importlib.util.spec_from_loader("panel", _loader))
@@ -149,15 +148,56 @@ def personal_skills():
     return sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md"))
 
 
-def launch_buffer(cwd, chosen, seen):
+def allowed_values():
+    """What each header line accepts, read fresh on every press: effort levels and model aliases from
+    `claude --help` and the models skill, skills from ~/.claude/skills. An empty list means "could not
+    read it", and that line is then not checked."""
+    try:
+        help_text = subprocess.run([claude_bin(), "--help"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, TypeError, subprocess.TimeoutExpired):
+        help_text = ""
+    effort = re.search(r"--effort <level>.*?\(([^)]*)\)", help_text, re.S)
+    model_help = re.search(r"--model <model>(.*?)\n  -", help_text, re.S)
+    models = re.findall(r"'([\w.-]+)'", model_help.group(1)) if model_help else []
+    try:  # the skill's Claude table: | `haiku` | `claude-haiku-5-5` | ...
+        models += [n for row in re.findall(r"^\| `([\w-]+)` \| `(claude-[\w-]+)`", MODELS_SKILL.read_text(), re.M)
+                   for n in row]
+    except OSError:
+        pass
+    return {
+        "model": list(dict.fromkeys(models)),
+        "effort": [e.strip() for e in effort.group(1).split(",")] if effort else [],
+        "skills": personal_skills(),
+        "others": OVERRIDE_STATES,
+        "old": ["keep", "close"],
+    }
+
+
+def problems(fields, values):
+    """Header values that would make a bad launch; the Lua side checks the same rules as you type."""
+    bad = []
+    for key in ("model", "effort", "others", "old"):
+        value, allowed = fields.get(key, ""), values.get(key) or []
+        full_model_id = key == "model" and value.startswith("claude-")
+        if allowed and value not in allowed and not full_model_id:
+            bad.append(f"{key}: {value or '(empty)'} is not one of {' '.join(allowed)}")
+    return bad
+
+
+def launch_buffer(cwd, chosen, seen, values):
     def row(key, value, comment):
         return f"{key + ':':<8}{value:<23} # {comment}"
+
+    def default(key, preferred):
+        options = values[key]
+        return preferred if preferred in options or not options else options[0]
+    short_models = [m for m in values["model"] if not m.startswith("claude-")]
     return "\n".join([
-        row("model", CHOICES["model"][0], " ".join(CHOICES["model"])),
-        row("effort", CHOICES["effort"][0], "low medium high xhigh max"),
+        row("model", default("model", "opus"), " ".join(short_models) or "could not read claude --help"),
+        row("effort", default("effort", "xhigh"), " ".join(values["effort"]) or "could not read claude --help"),
         row("skills", ", ".join(chosen), "seen here: " + (", ".join(seen) or "none")),
-        row("others", CHOICES["others"][0], " ".join(CHOICES["others"])),
-        row("old", CHOICES["old"][0], " ".join(CHOICES["old"])),
+        row("others", default("others", "name-only"), " ".join(values["others"])),
+        row("old", "keep", " ".join(values["old"])),
         row("name", f"{Path(cwd).name}-2", "shown in the prompt box and /resume"),
         "---",
         "",
@@ -183,17 +223,22 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     exported.write_text(wrap(body, sid, cwd))
 
     if os.path.realpath(cwd) != os.path.realpath(pane_path):
-        tmux("display-message", "-c", client, "-d", "5000",
+        tmux("display-message", "-c", client, "-d", "8000",
              f"handoff: session cwd {cwd} differs from pane {pane_path}; using the pane's")
 
+    values = allowed_values()
     buffer = stem.with_suffix(".launch.md")
-    buffer.write_text(launch_buffer(pane_path, *skill_defaults(pane_path, transcript)))
+    buffer.write_text(launch_buffer(pane_path, *skill_defaults(pane_path, transcript), values))
+    stem.with_suffix(".launch.values.json").write_text(json.dumps(values))  # read by handoff-buffer.lua
     stem.with_suffix(".launch.json").write_text(json.dumps({
         "dir": pane_path, "session": session_id, "client": client, "transcript": str(exported),
         "old_pid": info.get("pid") if transcript else None}))
     # nvim lives in /opt, which only the interactive shell puts on PATH; the popup runs with the server's.
     nvim = shutil.which("nvim") or "/opt/nvim-linux64/bin/nvim"
-    run = f"{shlex.join([nvim, '+$', '+startinsert', str(buffer)])} &&{shlex.join([sys.executable, __file__, '--launch', str(buffer)])}"
+    edit = [nvim, "+$", f"+luafile {BUFFER_LUA}", "+startinsert", str(buffer)]
+    aborted = ["tmux", "display-message", "-c", client, "-d", "8000", "handoff: :cq, nothing launched"]
+    run = (f"if {shlex.join(edit)}; then {shlex.join([sys.executable, __file__, '--launch', str(buffer)])}; "
+           f"else {shlex.join(aborted)}; fi")
     tmux("display-popup", "-c", client, "-w", "80%", "-h", "60%", "-d", pane_path,
          "-T", " handoff: :wq launches, :cq aborts ", "-E", run)
 
@@ -219,16 +264,17 @@ def launch(buffer):
     buffer = Path(buffer)
     ctx = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.json")).read_text())
     fields, note = parse_buffer(buffer.read_text())
-    if not note:
-        return tmux("display-message", "-c", ctx["client"], "handoff: empty note, nothing launched")
-    bad = [f"{k}={fields.get(k)!r}" for k, allowed in CHOICES.items() if fields.get(k) not in allowed]
-    if bad:
-        return tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched, bad {' '.join(bad)}")
+    values = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.values.json")).read_text())
+    bad = problems(fields, values)
+    if bad:  # the buffer refuses to write these; this catches :q on an unedited bad buffer
+        return tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched; {'; '.join(bad)}")
 
     chosen = [s for s in re.split(r"[,\s]+", fields.get("skills", "")) if s]
     overrides = {} if fields["others"] == "on" else {
         s: fields["others"] for s in personal_skills() if s not in chosen}
-    prompt = note + f"\n\nThe previous session's transcript is {ctx['transcript']} (bracketed, context only)."
+    # An empty note is fine: the new session gets the transcript as context and waits.
+    context = f"The previous session's transcript is {ctx['transcript']} (bracketed, context only)."
+    prompt = f"{note}\n\n{context}" if note else context
     if chosen:
         prompt += f" Load these skills: {', '.join(chosen)}."
     claude = claude_bin()
@@ -257,7 +303,7 @@ def close_old(pid, client):
     except (OSError, ValueError):
         status = None
     if status != "idle":
-        return tmux("display-message", "-c", client, f"handoff: old session {pid} is {status or 'gone'}, left running")
+        return tmux("display-message", "-c", client, "-d", "8000", f"handoff: old session {pid} is {status or 'gone'}, left running")
     os.kill(pid, signal.SIGTERM)
     tmux("display-message", "-c", client, f"handoff: closed old session {pid}")
 

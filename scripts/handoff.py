@@ -289,13 +289,21 @@ def launch(buffer):
     # claude runs as the window's command, not typed into a shell; a shell takes over when it exits so the
     # window stays. Its bin dir goes on PATH for what claude starts itself (npx MCP servers, node).
     env_path = f"{Path(claude).parent}:{os.environ.get('PATH', '')}"
-    made = subprocess.run(["tmux", "new-window", "-t", ctx["session"], "-c", ctx["dir"], "-e", f"PATH={env_path}",
-                           "zsh", "-c", '"$0" "$@"; exec zsh', *argv], capture_output=True, text=True)
+    made = subprocess.run(["tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", ctx["session"], "-c", ctx["dir"],
+                           "-e", f"PATH={env_path}", "zsh", "-c", '"$0" "$@"; exec zsh', *argv],
+                          capture_output=True, text=True)
     if made.returncode:  # printed too: the popup (-EE) stays open on a non-zero exit
         why = made.stderr.strip() or f"tmux new-window exited {made.returncode}"
         print(f"handoff: not launched; {why}")
         tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched; {why}")
         sys.exit(1)
+
+    if chosen:  # the pane's skill badge (scripts/skill-badge); best effort, the window is already up
+        try:
+            subprocess.run([str(Path(__file__).with_name("skill-badge")), "set", made.stdout.strip(), *chosen],
+                           capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     if fields["old"] == "close" and ctx.get("old_pid"):
         close_old(ctx["old_pid"], ctx["client"])

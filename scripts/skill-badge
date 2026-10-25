@@ -10,7 +10,7 @@
 
 The data is three pane options: @skills (load order), @preset, and @skill_badge, the text drawn:
 the preset, else the first skill, then +N for the rest. tmux.conf sends the focused pane's
-@skill_badge as the terminal title, which WezTerm draws top right of its window.
+@skill_badge as the terminal title, or "· <session>" without one, and WezTerm draws it top right.
 The border line is the per-pane prototype, off unless asked for. It is a window option and takes
 a row from every pane in its window, so `on` turns it on only in windows that have a badge, and
 `off` gives those rows back.

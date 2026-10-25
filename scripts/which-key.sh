@@ -117,10 +117,11 @@ for token, repeat, cmd in sorted(keys_of(table), key=lambda row: order(plain(row
 }
 
 client=$1 press=$2 before=$3 table=${4:-prefix}
-# The job starts ~0.1 s after the press (measured on this machine), so 0.4
-# puts the popup near the half second nvim's which-key uses. A group picked
-# from a popup opens at once: the pause is only for keys you might still type.
-delay=0.4
+# The job starts ~0.1 s after the press (measured on this machine), so 1.1
+# opens the popup about 1.2 s in. nvim's half second popped it up mid-chord
+# on keys already known by heart. A group picked from a popup opens at once:
+# the pause is only for keys you might still type.
+delay=1.1
 if [ "$(tmux show-option -gqv @wk_now)" = 1 ]; then
     tmux set-option -gu @wk_now
     delay=0

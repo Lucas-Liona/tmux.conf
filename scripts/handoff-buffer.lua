@@ -120,6 +120,11 @@ local function problems(s)
       table.insert(out, { lnum = skills.lnum, col = skills.col, severity = WARN, message = skill .. " is not a skill here" })
     end
   end
+  if s.prompt:sub(1, 1) == "/" then
+    local first = vim.tbl_filter(function(line) return line.text:match("%S") end, s.prompt_lines)[1]
+    table.insert(out, { lnum = first.lnum, col = 0, severity = WARN,
+      message = "a prompt starting with / would run as a command, so launch puts the transcript line first" })
+  end
   for _, line in ipairs(s.prompt_lines) do
     for _, n in ipairs(names(line.text)) do
       if not n.known then

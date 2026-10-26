@@ -378,9 +378,10 @@ def launch(buffer):
         s: fields["others"] for s in personal_skills() if s not in chosen}
     # An empty note is fine: the new session gets the transcript as context and waits.
     context = f"The previous session's transcript is {ctx['transcript']} (bracketed, context only)."
-    prompt = f"{note}\n\n{context}" if note else context
     if chosen:
-        prompt += f" Load these skills: {', '.join(chosen)}."
+        context += f" Load these skills: {', '.join(chosen)}."
+    # A prompt starting with / would run as a slash command (`claude -p "/usage"` does), so the context goes first.
+    prompt = (f"{context}\n\n{note}" if note.startswith("/") else f"{note}\n\n{context}") if note else context
     claude = claude_bin()
     argv = [claude, "--model", fields["model"], "--effort", fields["effort"]]
     if fields.get("name"):

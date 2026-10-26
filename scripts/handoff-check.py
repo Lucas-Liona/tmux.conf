@@ -112,11 +112,15 @@ def press(buf, project="/home/lucas/pin"):
     buf.with_name(buf.name.replace(".launch.md", ".launch.values.json")).write_text(json.dumps(p))
 
 
-def choose(buf, preset):
-    """Open buf in nvim the way prefix+T does (handoff-buffer.lua, without Lucas's config), set preset:, then
+def edit(buf, *commands):
+    """Open buf in nvim the way prefix+T does (handoff-buffer.lua, without Lucas's config), run commands, then
     :wq, and :cq if the write was refused. Exit 0 launches, non-zero aborts."""
-    return subprocess.run([NVIM, "--headless", "--clean", f"+luafile {LUA}", "-c", f"%s/^preset:.*/preset: {preset}/",
+    return subprocess.run([NVIM, "--headless", "--clean", f"+luafile {LUA}", *(a for c in commands for a in ("-c", c)),
                            "-c", "wq", "-c", "cq", str(buf)], capture_output=True, text=True, timeout=20)
+
+
+def choose(buf, preset):
+    return edit(buf, f"%s/^preset:.*/preset: {preset}/")
 
 
 class LaunchToday(unittest.TestCase):
@@ -228,6 +232,24 @@ class Buffer(unittest.TestCase):
             argv = s.launch(buf)
         self.assertTrue(argv[-1].startswith("take a /screenshot of /mnt/c/x\n\nThe previous session's"), argv[-1])
         self.assertTrue(argv[-1].endswith(" Load these skills: screenshot, obsidian, perf."), argv[-1])
+
+    def test_a_prompt_starting_with_a_slash_never_reaches_claude_first(self):
+        """claude runs a leading /name as a slash command (`claude -p "/usage"` did), so the context goes first."""
+        typed = "/share this, then take a /screenshot"
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            buf = s.buffer("", project)
+            press(buf, project)
+            run = edit(buf, f"call setline(1, {typed!r})")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            loaded = [n for n in ("share", "screenshot") if n in VALUES["skills"]] + ["obsidian", "perf"]  # share is one now
+            self.assertIn(f"detected skills: {' '.join(loaded)}\n", buf.read_text())
+            argv = s.launch(buf)
+        self.assertIn("screenshot", loaded)
+        self.assertFalse(argv[-1].startswith("/"), argv[-1])
+        self.assertEqual(argv[-1], f"The previous session's transcript is {TRANSCRIPT} (bracketed, context only)."
+                                   f" Load these skills: {', '.join(loaded)}.\n\n{typed}")
 
 
 if __name__ == "__main__":

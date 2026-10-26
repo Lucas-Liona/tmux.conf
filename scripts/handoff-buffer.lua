@@ -9,7 +9,7 @@ local values = vim.json.decode(table.concat(vim.fn.readfile((name:gsub("%.launch
 local ns = vim.api.nvim_create_namespace("handoff")
 local draw = vim.api.nvim_create_namespace("handoff-draw")
 local ERROR, WARN = vim.diagnostic.severity.ERROR, vim.diagnostic.severity.WARN
-local CHECKED = { "model", "effort", "preset", "others", "old" } -- a bad one blocks :wq; skills only warn
+local CHECKED = { "model", "effort", "preset", "others", "old", "send" } -- a bad one blocks :wq; skills only warn
 local docs, presets, defaults, models = values.skill_docs, values.presets, values.defaults, values.models or {}
 local known, shown = {}, {}
 for _, skill in ipairs(values.skills) do known[skill] = true end
@@ -153,8 +153,14 @@ local function problems(s)
     end
   end
   local m = models[model]
-  if codex_warning ~= "" and s.fields.model and (m and m.provider == "codex" or (model or ""):match("^gpt%-")) then
+  local codex = m and m.provider == "codex" or not m and (model or ""):match("^gpt%-")
+  if codex_warning ~= "" and s.fields.model and codex then
     table.insert(out, { lnum = s.fields.model.lnum, col = s.fields.model.col, severity = WARN, message = codex_warning })
+  end
+  local send = s.fields.send
+  if codex and (send and send.value or defaults.send) == "no" then -- handoff.py's NO_SEND_CODEX
+    table.insert(out, { lnum = send and send.lnum or s.bars[1], col = send and send.col or 0, severity = ERROR,
+      message = "send: no works with claude only: codex shows no input box this can tell is ready" })
   end
   local skills = s.fields.skills
   for skill in (skills and skills.value or ""):gmatch("[^,%s]+") do
@@ -267,7 +273,7 @@ local function candidates()
     return start, out
   end
   for _, value in ipairs(values[key] or {}) do
-    local preset, info = presets[value], ""
+    local preset, info = presets[value], ((values.value_docs or {})[key] or {})[value] or ""
     if key == "preset" and preset then
       local sets = {}
       for _, k in ipairs(values.order) do

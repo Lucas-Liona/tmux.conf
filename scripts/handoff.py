@@ -4,6 +4,7 @@
     handoff.py <pane_id> <pane_pid> <pane_current_path> <session_id> <client>
     handoff.py --launch <stamp-sid.launch.md>  what the popup runs after :wq
     handoff.py --export <transcript.jsonl>     print the export only (for checking)
+    handoff.py --type <pane> <prompt> <client> <claude>   send: no, in the background: type into claude's box
 
 The pane's Claude is found the way agent-send finds its socket: the nearest `claude` process below the
 pane's shell, whose ~/.claude/sessions/<pid>.json names the session id and cwd. Its transcript is written
@@ -233,6 +234,7 @@ def allowed_values():
         "skills": personal_skills(),
         "others": OVERRIDE_STATES,
         "old": ["keep", "close"],
+        "send": ["yes", "no"],
         "preset": list(presets([])),
     }
 
@@ -306,7 +308,18 @@ def problems(fields, values):
         if allowed and value not in allowed and not known:
             bad.append(f"{key}: {value or '(empty)'} is not one of {' '.join(allowed)}"
                        + (f" (what {model} supports)" if key == "effort" and model else ""))
+    if fields.get("send") == "no" and provider(model, values) == "codex":
+        bad.append(NO_SEND_CODEX)
     return bad
+
+
+# handoff-buffer.lua says the same
+NO_SEND_CODEX = "send: no works with claude only: codex shows no input box this can tell is ready"
+
+
+def provider(model, values):
+    known = values.get("models", {}).get(model)
+    return known["provider"] if known else "codex" if model.startswith("gpt-") else "claude"
 
 
 def press(cwd, chosen, values):
@@ -315,9 +328,12 @@ def press(cwd, chosen, values):
     cfg = tomllib.loads(CONFIG.read_text())
     defaults = {key: value.replace("{dir}", Path(cwd).name) for key, value in cfg["defaults"].items()}
     defaults["skills"] = " ".join(chosen)  # the auto preset's
+    # "keep: leaves the old session running; close: ..." in the help is what completion shows beside each value
+    value_docs = {key: {v: d.strip() for v, d in re.findall(r"([\w-]+): ([^;]+)", text) if v in (values.get(key) or [])}
+                  for key, text in cfg["help"].items()}
     return {**values, "config": cfg, "defaults": defaults, "order": list(dict.fromkeys([*cfg["show"], *defaults])),
             "presets": {name: {"fields": f, "prompt": p} for name, (f, p) in presets(chosen).items()},
-            "skill_docs": skill_docs()}
+            "skill_docs": skill_docs(), "value_docs": value_docs}
 
 
 def yaml_value(value):
@@ -487,18 +503,19 @@ def launch(buffer):
         context += f" Load these skills: {', '.join(chosen)}."
     # A prompt starting with / would run as a slash command (`claude -p "/usage"` does), so the context goes first.
     prompt = (f"{context}\n\n{note}" if note.startswith("/") else f"{note}\n\n{context}") if note else context
-    model = values.get("models", {}).get(fields["model"]) or {"provider": "codex" if fields["model"].startswith("gpt-")
-                                                                   else "claude", "id": fields["model"]}
-    if model["provider"] == "codex":
+    send = fields.get("send") != "no"
+    if provider(fields["model"], values) == "codex":
         # Codex takes no name and no skillOverrides; it reads the same skills through ~/.agents/skills.
-        argv = [codex_bin(), "-m", model["id"], "-c", f'model_reasoning_effort="{fields["effort"]}"', prompt]
+        model = values.get("models", {}).get(fields["model"], {}).get("id", fields["model"])
+        argv = [codex_bin(), "-m", model, "-c", f'model_reasoning_effort="{fields["effort"]}"', prompt]
     else:
         argv = [claude_bin(), "--model", fields["model"], "--effort", fields["effort"]]
         if fields.get("name"):
             argv += ["-n", fields["name"]]
         if overrides:
             argv += ["--settings", json.dumps({"skillOverrides": overrides})]
-        argv.append(prompt)
+        if send:
+            argv.append(prompt)
 
     # claude or codex runs as the window's command, not typed into a shell; a shell takes over when it exits
     # so the window stays. Its bin dir goes on PATH for what it starts itself (npx MCP servers, node).
@@ -511,6 +528,13 @@ def launch(buffer):
         tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched; {why}")
         sys.exit(1)
 
+    if not send:  # claude has no flag that fills its box unsent (claude --help 2.1.310, the CLI reference)
+        typed = buffer.with_name(buffer.name.replace(".launch.md", ".launch.prompt.md"))
+        typed.write_text(prompt)
+        subprocess.Popen([sys.executable, __file__, "--type", made.stdout.strip(), str(typed), ctx["client"], argv[0]],
+                         start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)  # its own session: it outlives the popup
+
     if chosen:  # the pane's skill badge (scripts/skill-badge); best effort, the window is already up
         try:
             subprocess.run([str(Path(__file__).with_name("skill-badge")), "set", made.stdout.strip(), *chosen],
@@ -520,6 +544,63 @@ def launch(buffer):
 
     if fields["old"] == "close" and ctx.get("old_pid"):
         close_old(ctx["old_pid"], ctx["client"])
+
+
+def running_in(pane, binary):
+    """Whether binary still runs in pane, or None once the pane is gone. Not pane_current_command: under the
+    window's zsh -c it says zsh while claude runs (tmux-wsl). A process below the pane's shell instead, with
+    binary in its command line (a script's is its second word)."""
+    rows = (line.split(" ", 1) for line in tmux("list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").splitlines())
+    shell = next((int(pid) for p, pid in rows if p == pane), None)
+    if shell is None:
+        return None
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            words = (proc / "cmdline").read_bytes().split(b"\0")[:2]
+        except OSError:
+            continue
+        if binary.encode() in words and depth_below(int(proc.name), shell) is not None:
+            return True
+    return False
+
+
+def input_box(pane):
+    """Whether pane shows claude's input box: a ❯ line between two ─ rules. A dialog's ❯ has no rules."""
+    lines = tmux("capture-pane", "-p", "-t", pane).splitlines()
+    rule = lambda line: len(line.strip()) >= 10 and set(line.strip()) == {"─"}
+    return any(line.startswith("❯") and rule(lines[i - 1]) and rule(lines[i + 1])
+               for i, line in enumerate(lines[1:-1], 1))
+
+
+def type_prompt(pane, prompt_file, client, binary, timeout=60):
+    """send: no. Wait until the new pane shows claude's input box with claude still in front, type the prompt
+    into it with Ctrl+J between lines and no Enter, then look for it in the box. Ctrl+J is claude's newline
+    that works in any terminal (https://code.claude.com/docs/en/interactive-mode#multiline-input); a paste
+    would collapse into [Pasted text]. Nothing is typed unless the box is there."""
+    prompt = Path(prompt_file).read_text()
+    kept = f"The prompt is in {prompt_file}."
+    def say(text):
+        tmux("display-message", "-c", client, "-d", "10000", f"handoff: {text}")
+    deadline = time.monotonic() + timeout
+    while not input_box(pane):
+        running = running_in(pane, binary)
+        if not running:
+            return say(f"send: no, but {'the new pane is gone' if running is None else 'claude exited'}; "
+                       f"nothing typed. {kept}")
+        if time.monotonic() > deadline:
+            return say(f"send: no, but claude showed no input box in {timeout} s; nothing typed. {kept}")
+        time.sleep(0.2)
+    for i, line in enumerate(prompt.split("\n")):
+        if i:
+            tmux("send-keys", "-t", pane, "C-j")
+        if line:
+            tmux("send-keys", "-t", pane, "-l", "--", line)
+    start = " ".join(prompt.split())[:24]
+    for _ in range(15):
+        if start in " ".join(tmux("capture-pane", "-p", "-J", "-t", pane).replace("\xa0", " ").split()):
+            return say("the prompt is in the new session's box, unsent: Enter sends it")
+        time.sleep(0.2)
+    say(f"typed the prompt into pane {pane} but cannot see it in the box; look before pressing Enter. {kept}")
 
 
 def close_old(pid, client):
@@ -541,5 +622,7 @@ if __name__ == "__main__":
         print(wrap(export(p), p.stem, "?"))
     elif sys.argv[1:2] == ["--launch"]:
         launch(sys.argv[2])
+    elif sys.argv[1:2] == ["--type"]:
+        type_prompt(*sys.argv[2:6])
     else:
         main(*sys.argv[1:6])

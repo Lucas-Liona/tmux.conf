@@ -8,6 +8,7 @@
 model:  fable
 skills: ""
 name:   redteam
+send:   "no"
 ---
 
 Red-team the previous session in the transcript. Read-only except one report.

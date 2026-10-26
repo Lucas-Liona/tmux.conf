@@ -4,23 +4,26 @@
 
 # Shown in this order in the frontmatter. A field left out is still in the file, hidden (nvim
 # does not draw it), and keeps its default or what the preset sets.
-show = ["model", "effort", "preset", "old"]
+show = ["model", "effort", "preset", "old", "send"]
 
 [defaults]
 model = "opus"
 effort = "xhigh"
 preset = "auto"
 old = "keep"
+send = "yes"
 others = "name-only"
 name = "{dir}-2"  # {dir}: the name of the pane's directory
 # skills: the auto preset's, worked out on each press
 
-# One line per field in the # block. {values} is what the field accepts today.
+# One line per field in the # block. {values} is what the field accepts today; "value: what it does"
+# pairs, split by ;, are also what completion shows beside each value.
 [help]
 model = "{values}, or a full claude-… id: claude's from claude --help and the models skill, the rest from codex debug models, which start codex"
 effort = "claude: {values}; a codex model has its own list, Tab shows each level and what it does"
 preset = "what each one sets (auto: the two skills loaded most here, and the old session's):"
-old = "keep leaves the old session running; close ends it once it is idle"
+old = "keep: leaves the old session running; close: ends it once it is idle"
+send = "yes: :wq starts it working; no: lands in the box, unsent (claude only)"
 skills = "the preset's skills, added to the prompt's /names"
 others = "what every other skill in ~/.claude/skills becomes: {values} (claude only)"
 name = "shown in the prompt box and /resume (claude only)"

@@ -104,14 +104,16 @@ class Server:
             {"dir": str(project), "session": self.session, "client": "", "transcript": TRANSCRIPT, "old_pid": None}))
         return buf
 
-    def launch(self, buf):
+    def launch(self, buf, box=False):
         """Run handoff.py --launch on buf and return the argv the stub claude or codex was started with;
-        self.ran says which of the two it was."""
+        self.ran says which of the two it was. With box, the stub claude then draws an input box after a
+        moment's startup, as claude does, and keeps every byte typed into it in self.dir / "typed"."""
         out = self.dir / "argv.json"
         for name in ("claude", "codex"):
             stub = self.dir / name
             stub.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
-                            f"open({str(out)!r}, 'w').write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n")
+                            f"open({str(out)!r}, 'w').write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n"
+                            + (BOX.replace("TYPED", repr(str(self.dir / "typed"))) if box and name == "claude" else ""))
             stub.chmod(0o755)
         run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True, text=True,
                              env={**self.env, "HANDOFF_CLAUDE": str(self.dir / "claude"),
@@ -124,6 +126,20 @@ class Server:
                 return argv
             time.sleep(0.1)
         raise AssertionError("the stub claude never ran in the new window")
+
+
+# The rest of a stub claude that draws claude's input box, a ❯ line between ─ rules, and records what it is sent.
+BOX = """import time, tty
+time.sleep(0.5)
+tty.setraw(0)
+typed = b""
+while True:
+    rule = "\\u2500" * 40
+    sys.stdout.write("\\x1b[2J\\x1b[H" + rule + "\\r\\n\\u276f\\xa0" + typed.decode().replace("\\n", "\\r\\n  ") + "\\r\\n" + rule + "\\r\\n")
+    sys.stdout.flush()
+    typed += os.read(0, 4096)
+    open(TYPED, "wb").write(typed)
+"""
 
 
 def stub_values(catalog=CATALOG):
@@ -242,9 +258,11 @@ class Preset(unittest.TestCase):
             run = choose(buf, "red-team")
             self.assertEqual(run.returncode, 0, run.stderr)
             argv = s.launch(buf)
+            typed = buf.with_name("pin.launch.prompt.md").read_text()  # red-team sets send: no: typed, not passed
         self.assertEqual(argv[:6], ["--model", "fable", "--effort", "xhigh", "-n", "redteam"])
-        self.assertTrue(argv[-1].startswith("Red-team the previous session"), argv[-1][:80])
-        self.assertNotIn("Load these skills", argv[-1])
+        self.assertTrue(typed.startswith("Red-team the previous session"), typed[:80])
+        self.assertNotIn("Load these skills", typed)
+        self.assertFalse(any(a.startswith("Red-team") for a in argv), "the prompt is not in claude's argv")
 
 
 class Buffer(unittest.TestCase):
@@ -331,6 +349,42 @@ class Codex(unittest.TestCase):
         self.assertEqual(argv, ["-m", "gpt-6-astra", "-c", 'model_reasoning_effort="ultra"',  # astra's own level
                                 f"review the badge\n\nThe previous session's transcript is {TRANSCRIPT} (bracketed,"
                                 " context only). Load these skills: obsidian, perf."])
+
+
+class Send(unittest.TestCase):
+    """send: yes passes the prompt to claude (LaunchToday); no types it into claude's box and leaves it unsent."""
+
+    def test_no_types_the_prompt_into_the_box_without_enter(self):
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            buf = s.buffer("", project)
+            press(buf, project)
+            run = edit(buf, "%s/^send:.*/send:   no/", "call setline('$', 'two lines')", "call append('$', 'of prompt')")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            argv = s.launch(buf, box=True)
+            want = (f"two lines\nof prompt\n\nThe previous session's transcript is {TRANSCRIPT} (bracketed, context only)."
+                    " Load these skills: obsidian, perf.").encode()
+            typed = s.dir / "typed"
+            for _ in range(100):  # the typer waits for the box, then types
+                if typed.exists() and typed.read_bytes() == want:
+                    break
+                time.sleep(0.1)
+            self.assertEqual(typed.read_bytes() if typed.exists() else b"", want)
+        self.assertNotIn(b"\r", want)  # no Enter: Ctrl+J between lines is \n
+        self.assertFalse(argv[-1].startswith("two lines"), "the prompt is not in claude's argv")
+
+    def test_no_with_a_codex_model_is_refused(self):
+        v = stub_values()
+        fields = {"model": "astra", "effort": "high", "preset": "auto", "others": "name-only", "old": "keep", "send": "no"}
+        self.assertEqual(handoff.problems(fields, v), [handoff.NO_SEND_CODEX])
+        self.assertEqual(handoff.problems({**fields, "send": "yes"}, v), [])
+        with tempfile.TemporaryDirectory() as tmp:  # and the buffer refuses it as you type
+            buf = Path(tmp) / "pin.launch.md"
+            press(buf, values=v)
+            run = edit(buf, "%s/^model:.*/model:  astra/", "%s/^send:.*/send:   no/")
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn(handoff.NO_SEND_CODEX, run.stderr)
 
 
 class Catalog(unittest.TestCase):

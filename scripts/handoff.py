@@ -16,8 +16,10 @@ Then a popup opens nvim on a launch buffer, laid out like git's commit buffer:
     ━━━━━━━━
     model:  opus        every field, in handoff.toml's order; the ones it does not show are in the
     preset: auto        file too, hidden by handoff-buffer.lua, so the file holds every value
-    ━━━━━━━━
+
     detected skills: …  the prompt's /names and the preset's skills; drawn, never read
+    ━━━━━━━━
+
     # lines starting with # are dropped: what each field accepts and means
 
 A preset (handoff-presets.md, laid out the same way) fills in the fields it sets; handoff-buffer.lua does
@@ -276,15 +278,18 @@ def comment_block(p, seen):
 
 
 def render(p, seen):
-    """The buffer as it opens: an empty prompt, a bar, every field (the hidden ones too), a bar, the
-    detected skills and the # block. Opening it in nvim and writing it changes nothing."""
+    """The buffer as it opens: an empty prompt, a bar, every field (the hidden ones too), the detected
+    skills a blank line below them, a bar, and the # block a blank line below that. Opening it in nvim and
+    writing it changes nothing."""
     d = p["defaults"]
     return "\n".join([
         "",
         BAR,
         *(row(key, d.get(key, "")) for key in p["order"]),
-        BAR,
+        "",
         detected_line(detected("", d.get("skills", ""), set(p["skill_docs"]))),
+        BAR,
+        "",
         *comment_block(p, seen),
     ]) + "\n"
 
@@ -335,15 +340,16 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
 
 def parse_buffer(text):
     """(fields, prompt). Lines starting with # are dropped first, as in git's commit buffer. The prompt is
-    the text above the first bar; the fields are the `key: value` lines from there to the second bar.
-    Nothing after it is read: launch() works the detected skills out again from the prompt and skills:."""
+    the text above the first bar; the fields are the `key: value` lines from there to the second bar, with a
+    one-word key, so "detected skills:" is not one. That line is never read: launch() works the skills out
+    again from the prompt and skills:. Nothing after the second bar is read either."""
     lines = [line for line in text.splitlines() if not line.startswith("#")]
     bars = [i for i, line in enumerate(lines) if line and set(line) == {"━"}] + [len(lines)] * 2
     fields = {}
     for line in lines[bars[0] + 1:bars[1]]:
         key, sep, value = line.partition(":")
-        if sep and key.strip():
-            fields[key.strip()] = value.strip()
+        if sep and key.isalnum():  # handoff-buffer.lua: ^%w+:
+            fields[key] = value.strip()
     return fields, "\n".join(lines[:bars[0]]).strip()
 
 

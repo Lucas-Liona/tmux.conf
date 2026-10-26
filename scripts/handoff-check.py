@@ -216,8 +216,8 @@ class Buffer(unittest.TestCase):
     """What launch reads from buffer v2: the prompt above the first bar, the fields between the bars."""
 
     def test_comment_lines_and_bars_never_reach_the_prompt(self):
-        fields, prompt = handoff.parse_buffer(f"do this\n# not this\nthen that\n{handoff.BAR}\nmodel: opus\n"
-                                              f"{handoff.BAR}\ndetected skills: perf\n# the end\n")
+        fields, prompt = handoff.parse_buffer(f"do this\n# not this\nthen that\n{handoff.BAR}\nmodel: opus\n\n"
+                                              f"detected skills: perf\n{handoff.BAR}\n\n# the end\n")
         self.assertEqual(prompt, "do this\nthen that")
         self.assertEqual(fields, {"model": "opus"})
 

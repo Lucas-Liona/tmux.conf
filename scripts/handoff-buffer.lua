@@ -1,5 +1,5 @@
--- The handoff launch buffer (handoff.py opens it with +luafile): the prompt on top, the fields between two
--- bars, the detected skills under them, and # lines that launch drops. What it needs comes from
+-- The handoff launch buffer (handoff.py opens it with +luafile): the prompt on top, the fields and the
+-- detected skills between two bars, and # lines that launch drops. What it needs comes from
 -- <stem>.launch.values.json, which handoff.py writes fresh on every press: handoff.toml, the presets, and
 -- each skill's description and path. Everything here is buffer-local; ~/.config/nvim is not touched.
 local buf = vim.api.nvim_get_current_buf()
@@ -24,7 +24,8 @@ local function is_bar(line) return line ~= "" and line:gsub("━", "") == "" end
 local function row(key, value) return (("%-8s%s"):format(key .. ":", value):gsub("%s+$", "")) end -- as handoff.py's
 
 -- The buffer by line (0-based), read the way handoff.py's parse_buffer reads it: # lines dropped, the prompt
--- above the first bar, `key: value` fields up to the second. Also where the detected skills line is.
+-- above the first bar, `key: value` fields up to the second. Also where the detected skills line and the
+-- last field are.
 local function shape()
   local s, prompt = { bars = {}, fields = {}, prompt_lines = {} }, {}
   for i, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
@@ -34,11 +35,14 @@ local function shape()
     elseif #s.bars == 0 then
       table.insert(prompt, line)
       table.insert(s.prompt_lines, { lnum = i - 1, text = line })
+    elseif #s.bars == 1 and line:match("^detected skills:") then
+      s.detected = s.detected or i - 1
     elseif #s.bars == 1 then
       local key, rest = line:match("^(%w+):(.*)$")
-      if key then s.fields[key] = { lnum = i - 1, col = #key + 1 + #rest:match("^%s*"), value = vim.trim(rest) } end
-    elseif not s.detected and line:match("^detected skills:") then
-      s.detected = i - 1
+      if key then
+        s.fields[key] = { lnum = i - 1, col = #key + 1 + #rest:match("^%s*"), value = vim.trim(rest) }
+        s.last_field = i - 1
+      end
     end
   end
   s.prompt = vim.trim(table.concat(prompt, "\n"))
@@ -87,7 +91,8 @@ local function apply(from, to)
       if s.fields[key] then
         set_lines(s.fields[key].lnum, s.fields[key].lnum + 1, { row(key, value) })
       elseif s.bars[2] then
-        set_lines(s.bars[2], s.bars[2], { row(key, value) })
+        local after = (s.last_field or s.bars[1]) + 1
+        set_lines(after, after, { row(key, value) })
       end
     end
   end
@@ -175,7 +180,7 @@ local function sync()
   end
   if s.bars[2] then
     local line = "detected skills: " .. (#detected(s) > 0 and table.concat(detected(s), " ") or "(none)")
-    if s.detected then set_lines(s.detected, s.detected + 1, { line }) else set_lines(s.bars[2] + 1, s.bars[2] + 1, { line }) end
+    if s.detected then set_lines(s.detected, s.detected + 1, { line }) else set_lines(s.bars[2], s.bars[2], { "", line }) end
     s = shape()
   end
   paint(s)

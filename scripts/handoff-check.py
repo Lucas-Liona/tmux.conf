@@ -425,5 +425,24 @@ class Catalog(unittest.TestCase):
             self.assertEqual(handoff.problems(fields, v), [], "a claude launch does not wait on codex")
 
 
+class Export(unittest.TestCase):
+    """The exported transcript shows each Bash call's command, under its description."""
+
+    def test_bash_calls_show_their_command(self):
+        commands = ["agent-claim list", "cat <<'EOF' > notes.md\n```\nEOF", "\n".join(f"echo {i}" for i in range(30))]
+        calls = [{"name": "Bash", "input": {"command": c, "description": "Show claims"}} for c in commands]
+        calls.append({"name": "Read", "input": {"file_path": "/home/lucas/x.md"}})
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.jsonl"
+            path.write_text("".join(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", **call}]}},
+                                               separators=(",", ":")) + "\n" for call in calls))  # Claude's own spacing
+            md = handoff.export(path)
+        self.assertIn("- tool Bash: Show claims\n```bash\nagent-claim list\n```\n", md)
+        self.assertIn("````bash\ncat <<'EOF' > notes.md\n```\nEOF\n````", md)  # a longer fence than the command's
+        self.assertIn("echo 19\n# … 10 more lines in the transcript\n```", md)
+        self.assertNotIn("echo 20", md)
+        self.assertIn("- tool Read: /home/lucas/x.md", md)  # other tools keep their one line
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

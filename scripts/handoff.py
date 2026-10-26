@@ -59,6 +59,7 @@ YAML_WORDS = {"y", "yes", "n", "no", "true", "false", "on", "off", "null", "~"}
 SKILL_NAME = re.compile(r"(?<![^\s(\"'])/([A-Za-z0-9_][A-Za-z0-9_.:-]*)")
 # panel.is_injected drops every line starting with "<"; these are Lucas's own: a paste, and a `!` command.
 LUCAS_TAGS = ("<pasted_content", "<bash-input", "<bash-stdout")
+BASH_LINES = 20  # of a command, in the export; a heredoc that writes a file can run to hundreds
 # skillOverrides' states have no code source to read; they are the table at
 # https://code.claude.com/docs/en/skills#skilloverrides (checked 2026-10-25).
 OVERRIDE_STATES = ["name-only", "on", "user-invocable-only", "off"]
@@ -117,14 +118,29 @@ def pane_claude(pane_pid):
 def tool_line(block):
     inp = block.get("input") or {}
     name = block.get("name", "?")
+    if name == "Bash" and inp.get("command"):
+        return bash_call(inp)
     hint = (inp.get("description") or inp.get("file_path") or inp.get("command") or inp.get("pattern")
             or inp.get("query") or inp.get("prompt") or inp.get("url") or "")
     hint = " ".join(str(hint).split())
     return f"- tool {name}: {hint[:160]}" if hint else f"- tool {name}"
 
 
+def bash_call(inp):
+    """The description, then the command as it ran, in a fence longer than any backtick run inside it.
+    The fence is not indented under the list item, so a heredoc copied out of the raw file still ends."""
+    command = inp["command"].rstrip()
+    lines = command.splitlines()
+    if len(lines) > BASH_LINES:
+        lines = lines[:BASH_LINES] + [f"# … {len(lines) - BASH_LINES} more lines in the transcript"]
+    fence = "`" * max(3, 1 + max(map(len, re.findall(r"`+", command)), default=0))
+    label = " ".join(str(inp.get("description", "")).split())
+    return "\n".join([f"- tool Bash: {label}" if label else "- tool Bash", fence + "bash", *lines, fence])
+
+
 def export(path):
-    """Every prompt and reply in full, compaction summaries, and one line per tool call, in order."""
+    """Every prompt and reply in full, compaction summaries, one line per tool call and each Bash call's
+    command, in order."""
     out = []
     for d in panel.records(path, ('"type":"user"', '"type":"assistant"')):
         content = d.get("message", {}).get("content")

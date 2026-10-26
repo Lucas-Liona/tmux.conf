@@ -245,7 +245,9 @@ if ok_cmp then
     end, found or {}) })
   end
   cmp.register_source("handoff", source)
-  cmp.setup.buffer({ sources = cmp.config.sources({ { name = "handoff" } }, { { name = "path" } }) })
+  -- This source alone: cmp-path, as the fallback group, listed / (usr/, bin/) for any /word that is not a
+  -- skill and for anything typed below the bars.
+  cmp.setup.buffer({ sources = { { name = "handoff" } } })
 else
   function _G.handoff_complete(findstart, base)
     local start, found = candidates()

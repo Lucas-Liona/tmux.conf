@@ -43,6 +43,19 @@ VALUES = {
     "old": ["keep", "close"],
 }
 TRANSCRIPT = "/tmp/handoff-check-transcript.md"  # only named in the prompt, never read
+# A stand-in for `codex debug models`: its shape as codex-cli 0.162.1 printed it on 2026-10-25, cut down.
+CATALOG = {"models": [
+    {"slug": "gpt-6-astra", "description": "Frontier intelligence for the most demanding work.", "visibility": "list",
+     "priority": 2, "supported_reasoning_levels": [
+         {"effort": e, "description": d} for e, d in [("low", "Fast responses with lighter reasoning"),
+                                                     ("high", "Greater reasoning depth for complex problems"),
+                                                     ("xhigh", "Extra high reasoning depth for complex problems"),
+                                                     ("ultra", "Maximum reasoning with automatic task delegation")]]},
+    {"slug": "gpt-6-luna", "description": "Fast and affordable model for easier tasks.", "visibility": "list",
+     "priority": 4, "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh", "max")]},
+    {"slug": "codex-auto-review", "description": "Automatic approval review model for Codex.", "visibility": "hide",
+     "priority": 9, "supported_reasoning_levels": [{"effort": "medium"}]},
+]}
 
 
 @cache
@@ -113,11 +126,23 @@ class Server:
         raise AssertionError("the stub claude never ran in the new window")
 
 
-def press(buf, project="/home/lucas/pin"):
+def stub_values(catalog=CATALOG):
+    """allowed_values() as a press reads it, with a stub codex printing catalog (a dict, or raw text)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = Path(tmp) / "codex"
+        text = json.dumps(catalog) if isinstance(catalog, dict) else catalog
+        stub.write_text(f"#!/usr/bin/env python3\nprint({text!r})\n")
+        stub.chmod(0o755)
+        saved, os.environ["HANDOFF_CODEX"] = os.environ.get("HANDOFF_CODEX"), str(stub)
+        try:
+            return handoff.allowed_values()
+        finally:
+            os.environ.pop("HANDOFF_CODEX") if saved is None else os.environ.update(HANDOFF_CODEX=saved)
+
+
+def press(buf, project="/home/lucas/pin", values=None):
     """The default buffer and the values.json beside it that handoff-buffer.lua reads, as a press writes them."""
-    codex = handoff.codex_models()
-    p = handoff.press(str(project), ["obsidian", "perf"], {**VALUES, "preset": list(handoff.presets([])),
-                                                           "model": VALUES["model"] + list(codex), "codex": codex})
+    p = handoff.press(str(project), ["obsidian", "perf"], values or stub_values())
     buf.write_text(handoff.render(p, []))
     buf.with_name(buf.name.replace(".launch.md", ".launch.values.json")).write_text(json.dumps(p))
 
@@ -294,19 +319,56 @@ class Codex(unittest.TestCase):
     """model: a Codex model from the models skill starts codex instead, with the same prompt."""
 
     def test_astra_starts_codex_with_the_prompt(self):
-        self.assertEqual(handoff.codex_models().get("astra"), "gpt-6-astra", "the models skill's Codex table")
         with Server() as s:
             project = s.dir / "pin"
             project.mkdir()
             buf = s.buffer("", project)
             press(buf, project)
-            run = edit(buf, "%s/^model:.*/model:  astra/", "%s/^effort:.*/effort: max/", "call setline('$', 'review the badge')")
+            run = edit(buf, "%s/^model:.*/model:  astra/", "%s/^effort:.*/effort: ultra/", "call setline('$', 'review the badge')")
             self.assertEqual(run.returncode, 0, run.stderr)
             argv = s.launch(buf)
         self.assertEqual(s.ran, "codex")
-        self.assertEqual(argv, ["-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"',  # codex has no max
+        self.assertEqual(argv, ["-m", "gpt-6-astra", "-c", 'model_reasoning_effort="ultra"',  # astra's own level
                                 f"review the badge\n\nThe previous session's transcript is {TRANSCRIPT} (bracketed,"
                                 " context only). Load these skills: obsidian, perf."])
+
+
+class Catalog(unittest.TestCase):
+    """Models and efforts from the installed CLIs: claude --help, and `codex debug models` (a stub here)."""
+
+    def test_effort_follows_the_model(self):
+        v = stub_values()
+        self.assertEqual(v["models"]["astra"]["id"], "gpt-6-astra")  # the last word of the id names it
+        self.assertIn(["ultra", "Maximum reasoning with automatic task delegation"], v["models"]["astra"]["efforts"])
+        self.assertNotIn("ultra", handoff.efforts_for("luna", v))
+        self.assertEqual(handoff.efforts_for("opus", v), v["effort"])
+        self.assertNotIn("codex-auto-review", v["model"], "a hidden model is not offered")
+        base = {"preset": "auto", "others": "name-only", "old": "keep"}
+        self.assertEqual(handoff.problems({**base, "model": "astra", "effort": "ultra"}, v), [])
+        self.assertEqual(handoff.problems({**base, "model": "luna", "effort": "ultra"}, v),
+                         ["effort: ultra is not one of low medium high xhigh max (what luna supports)"])
+
+    def test_an_effort_the_model_lacks_blocks_wq(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = Path(tmp) / "pin.launch.md"
+            press(buf)
+            before = buf.read_text()
+            run = edit(buf, "%s/^model:.*/model:  luna/", "%s/^effort:.*/effort: ultra/")
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("effort: ultra is not one of low medium high xhigh max (what luna supports)", run.stderr)
+            self.assertEqual(buf.read_text(), before)
+
+    def test_a_broken_catalog_falls_back_and_says_so(self):
+        v = stub_values("codex debug models: unknown subcommand")
+        self.assertTrue(v["codex_warning"].startswith("codex debug models failed"), v["codex_warning"])
+        self.assertEqual(v["models"]["astra"]["id"], "gpt-6-astra", "the models skill's Codex table")
+        self.assertEqual(handoff.efforts_for("astra", v), [], "efforts unchecked")
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = Path(tmp) / "pin.launch.md"
+            press(buf, values=v)
+            self.assertIn("# ⚠ codex debug models failed", buf.read_text())
+            fields, _ = handoff.parse_buffer(buf.read_text())
+            self.assertEqual(handoff.problems(fields, v), [], "a claude launch does not wait on codex")
 
 
 if __name__ == "__main__":

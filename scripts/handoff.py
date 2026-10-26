@@ -61,9 +61,6 @@ LUCAS_TAGS = ("<pasted_content", "<bash-input", "<bash-stdout")
 # skillOverrides' states have no code source to read; they are the table at
 # https://code.claude.com/docs/en/skills#skilloverrides (checked 2026-10-25).
 OVERRIDE_STATES = ["name-only", "on", "user-invocable-only", "off"]
-# Codex's model_reasoning_effort has no max: minimal low medium high xhigh, per
-# https://developers.openai.com/codex/config-sample (checked 2026-10-25).
-CODEX_EFFORT = {"max": "xhigh"}
 MODELS_SKILL = SKILLS / "models/SKILL.md"
 BUFFER_LUA = Path(__file__).with_name("handoff-buffer.lua")
 # panel.py already knows which "user" lines are Lucas and which are injected reminders; reuse that, unedited.
@@ -208,26 +205,31 @@ def presets(auto):
 
 
 def allowed_values():
-    """What each field accepts, read fresh on every press: effort levels and model aliases from
-    `claude --help` and the models skill (Codex's too), skills from ~/.claude/skills. An empty list means
-    "could not read it", and that line is then not checked."""
+    """What each field accepts, read fresh on every press. Models and efforts come from the installed CLIs
+    (see models()), skills from ~/.claude/skills. An empty list means "could not read it", and that field
+    is then not checked."""
+    try:  # codex answers while claude does: 0.1-0.5 s and 0.2 s measured, together 0.25 s, so no cache
+        catalog = subprocess.Popen([codex_bin() or "codex", "debug", "models"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True, env=bin_on_path(codex_bin()))
+    except OSError:
+        catalog = None
     try:
         help_text = subprocess.run([claude_bin(), "--help"], capture_output=True, text=True, timeout=10).stdout
     except (OSError, TypeError, subprocess.TimeoutExpired):
         help_text = ""
     effort = re.search(r"--effort <level>.*?\(([^)]*)\)", help_text, re.S)
-    model_help = re.search(r"--model <model>(.*?)\n  -", help_text, re.S)
-    models = re.findall(r"'([\w.-]+)'", model_help.group(1)) if model_help else []
-    try:  # the skill's Claude table: | `haiku` | `claude-haiku-5-5` | ...
-        models += [n for row in re.findall(r"^\| `([\w-]+)` \| `(claude-[\w-]+)`", MODELS_SKILL.read_text(), re.M)
-                   for n in row]
-    except OSError:
-        pass
-    codex = codex_models()
+    efforts = [e.strip() for e in effort.group(1).split(",")] if effort else []
+    try:
+        out = catalog.communicate(timeout=5)[0] if catalog else ""
+    except subprocess.TimeoutExpired:
+        catalog.kill()
+        out = ""
+    found, warning = models(help_text, efforts, out)
     return {
-        "model": list(dict.fromkeys(models + list(codex))),
-        "codex": codex,
-        "effort": [e.strip() for e in effort.group(1).split(",")] if effort else [],
+        "model": [name for name, m in found.items() if m["listed"]],
+        "models": found,
+        "codex_warning": warning,
+        "effort": efforts,
         "skills": personal_skills(),
         "others": OVERRIDE_STATES,
         "old": ["keep", "close"],
@@ -235,27 +237,75 @@ def allowed_values():
     }
 
 
-def codex_models():
-    """{name: id} from the models skill's Codex table, | Astra | `gpt-6-astra` | ...: astra and gpt-6-astra
-    both name gpt-6-astra. A model here, or any gpt-... id, starts codex instead of claude."""
+def bin_on_path(binary):
+    """The environment with binary's dir first on PATH: codex is a node script, and node comes from nvm too."""
+    return {**os.environ, "PATH": f"{Path(binary or '.').parent}:{os.environ.get('PATH', '')}"}
+
+
+def models(help_text, claude_efforts, catalog_json):
+    """({name: model}, warning), every model: value with what it is. model is {provider, id, description,
+    listed (offered by completion), efforts: [[effort, description]]}.
+
+    Claude lists its aliases in --help and its efforts there for every model, without descriptions; the
+    models skill's table is the only place that pairs alias, id and Anthropic's description. Codex prints
+    its catalog with `codex debug models`: per model a description and its own efforts, each described.
+    Each listed model also answers to the last word of its id (astra), the first in codex's priority
+    order winning (sol is gpt-6.1-sol). That command sits under debug: if it fails or changes shape, the
+    models skill's Codex table stands in, efforts unchecked, and the warning says so."""
+    named = re.search(r"--model <model>(.*?)\n  -", help_text, re.S)
+    claude = {name: "" for name in (re.findall(r"'([\w.-]+)'", named.group(1)) if named else [])}
     try:
-        rows = re.findall(r"^\| ([^|`]+?) \| `(gpt-[\w.-]+)` \|", MODELS_SKILL.read_text(), re.M)
+        skill = MODELS_SKILL.read_text()
     except OSError:
-        return {}
-    return {name: model for label, model in rows for name in (label.split()[-1].lower(), model)}
+        skill = ""
+    for alias, model, description in re.findall(r"^\| `([\w-]+)` \| `(claude-[\w-]+)` \| ([^|]*) \|", skill, re.M):
+        claude[alias] = claude[model] = description.strip()
+    described = [[e, "listed by claude --help, which describes none"] for e in claude_efforts]
+    found = {name: {"provider": "claude", "id": name, "description": d, "listed": True, "efforts": described}
+             for name, d in claude.items()}
+    try:
+        catalog = [{"id": m["slug"], "description": m.get("description") or "", "listed": m.get("visibility") == "list",
+                    "efforts": [[level["effort"], level.get("description") or ""] for level in m["supported_reasoning_levels"]]}
+                   for m in sorted(json.loads(catalog_json)["models"], key=lambda m: m.get("priority", 99))]
+        warning = "" if catalog else "codex debug models listed no models"
+    except (ValueError, KeyError, TypeError, AttributeError):
+        catalog, warning = [], "codex debug models failed or changed shape"
+    if warning:
+        catalog = [{"id": model, "description": f"{label.strip()}, from the models skill", "listed": True, "efforts": []}
+                   for label, model in re.findall(r"^\| ([^|`]+?) \| `(gpt-[\w.-]+)` \|", skill, re.M)]
+        warning += ": codex models come from the models skill, their efforts unchecked"
+    for m in catalog:
+        alias = m["id"].rsplit("-", 1)[-1]
+        for name in ([alias] if m["listed"] and alias not in found else []) + [m["id"]]:
+            found[name] = {"provider": "codex", **m}
+    return found, warning
+
+
+def efforts_for(model, values):
+    """What effort: may be with this model; [] means not checked (a codex model the catalog did not describe)."""
+    m = values.get("models", {}).get(model)
+    if m:
+        return [effort for effort, _ in m["efforts"]]
+    return values.get("effort", []) if model.startswith("claude-") or "models" not in values else []
 
 
 def problems(fields, values):
     """Field values that would make a bad launch; the Lua side checks the same rules as you type."""
     bad = [f"{key}: {value!r} is a YAML list or map; write it as one line of text"
            for key, value in fields.items() if not isinstance(value, str)]
+    model = fields.get("model", "") if isinstance(fields.get("model", ""), str) else ""
     for key in ("model", "effort", "preset", "others", "old"):
         value, allowed = fields.get(key, ""), values.get(key) or []
         if not isinstance(value, str):
             continue
-        full_model_id = key == "model" and value.startswith(("claude-", "gpt-"))
-        if allowed and value not in allowed and not full_model_id:
-            bad.append(f"{key}: {value or '(empty)'} is not one of {' '.join(allowed)}")
+        if key == "effort":
+            allowed = efforts_for(model, values)
+        # claude takes any full model name; a gpt- one is codex's to know, unless its catalog could not be read
+        known = key == "model" and (value in values.get("models", {}) or value.startswith("claude-")
+                                    or value.startswith("gpt-") and ("models" not in values or values.get("codex_warning")))
+        if allowed and value not in allowed and not known:
+            bad.append(f"{key}: {value or '(empty)'} is not one of {' '.join(allowed)}"
+                       + (f" (what {model} supports)" if key == "effort" and model else ""))
     return bad
 
 
@@ -292,6 +342,8 @@ def comment_block(p, seen):
     short_models = [m for m in p["model"] if not m.startswith(("claude-", "gpt-"))]
     accepts = {"model": " ".join(short_models) or "could not read claude --help"}
     lines = cfg["text"]["top"].strip("\n").replace("{seen}", " ".join(seen) or "none").split("\n") + [""]
+    if p.get("codex_warning"):
+        lines += [f"⚠ {p['codex_warning']}", ""]
     for key in show:
         lines.append(f"{key:<8} " + cfg["help"].get(key, "").replace(
             "{values}", accepts.get(key) or " ".join(p.get(key) or []) or "could not read claude --help"))
@@ -435,12 +487,11 @@ def launch(buffer):
         context += f" Load these skills: {', '.join(chosen)}."
     # A prompt starting with / would run as a slash command (`claude -p "/usage"` does), so the context goes first.
     prompt = (f"{context}\n\n{note}" if note.startswith("/") else f"{note}\n\n{context}") if note else context
-    codex = values.get("codex", {})
-    if fields["model"] in codex or fields["model"].startswith("gpt-"):
+    model = values.get("models", {}).get(fields["model"]) or {"provider": "codex" if fields["model"].startswith("gpt-")
+                                                                   else "claude", "id": fields["model"]}
+    if model["provider"] == "codex":
         # Codex takes no name and no skillOverrides; it reads the same skills through ~/.agents/skills.
-        effort = CODEX_EFFORT.get(fields["effort"], fields["effort"])
-        argv = [codex_bin(), "-m", codex.get(fields["model"], fields["model"]),
-                "-c", f'model_reasoning_effort="{effort}"', prompt]
+        argv = [codex_bin(), "-m", model["id"], "-c", f'model_reasoning_effort="{fields["effort"]}"', prompt]
     else:
         argv = [claude_bin(), "--model", fields["model"], "--effort", fields["effort"]]
         if fields.get("name"):
@@ -451,9 +502,8 @@ def launch(buffer):
 
     # claude or codex runs as the window's command, not typed into a shell; a shell takes over when it exits
     # so the window stays. Its bin dir goes on PATH for what it starts itself (npx MCP servers, node).
-    env_path = f"{Path(argv[0]).parent}:{os.environ.get('PATH', '')}"
     made = subprocess.run(["tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", ctx["session"], "-c", ctx["dir"],
-                           "-e", f"PATH={env_path}", "zsh", "-c", '"$0" "$@"; exec zsh', *argv],
+                           "-e", f"PATH={bin_on_path(argv[0])['PATH']}", "zsh", "-c", '"$0" "$@"; exec zsh', *argv],
                           capture_output=True, text=True)
     if made.returncode:  # printed too: the popup (-EE) stays open on a non-zero exit
         why = made.stderr.strip() or f"tmux new-window exited {made.returncode}"

@@ -17,8 +17,8 @@ name = "{dir}-2"  # {dir}: the name of the pane's directory
 
 # One line per field in the # block. {values} is what the field accepts today.
 [help]
-model = "{values}, or a full claude-… or gpt-… id; astra, sol, luna and gpt-… start codex"
-effort = "{values}; on codex, max is xhigh"
+model = "{values}, or a full claude-… id: claude's from claude --help and the models skill, the rest from codex debug models, which start codex"
+effort = "claude: {values}; a codex model has its own list, Tab shows each level and what it does"
 preset = "what each one sets (auto: the two skills loaded most here, and the old session's):"
 old = "keep leaves the old session running; close ends it once it is idle"
 skills = "the preset's skills, added to the prompt's /names"

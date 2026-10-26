@@ -10,7 +10,7 @@ local ns = vim.api.nvim_create_namespace("handoff")
 local draw = vim.api.nvim_create_namespace("handoff-draw")
 local ERROR, WARN = vim.diagnostic.severity.ERROR, vim.diagnostic.severity.WARN
 local CHECKED = { "model", "effort", "preset", "others", "old" } -- a bad one blocks :wq; skills only warn
-local docs, presets, defaults = values.skill_docs, values.presets, values.defaults
+local docs, presets, defaults, models = values.skill_docs, values.presets, values.defaults, values.models or {}
 local known, shown = {}, {}
 for _, skill in ipairs(values.skills) do known[skill] = true end
 for skill in pairs(docs) do known[skill] = true end
@@ -100,6 +100,12 @@ local function set_lines(first, last, new)
   vim.api.nvim_buf_set_lines(buf, first, last, false, new)
 end
 
+-- What effort: may be with this model, as handoff.py's efforts_for(): [[effort, description]], {} = unchecked.
+local function levels(model)
+  if models[model] then return models[model].efforts end
+  return (model or ""):match("^claude%-") and vim.tbl_map(function(e) return { e, "" } end, values.effort or {}) or {}
+end
+
 local function notice(text) vim.schedule(function() vim.api.nvim_echo({ { "handoff: " .. text, "WarningMsg" } }, true, {}) end) end
 
 -- A preset fills in the fields it sets, and gives back their defaults to the ones the last preset set. Its
@@ -131,14 +137,24 @@ local function problems(s)
       message = "the fields need their frontmatter: a --- first line, the fields, a --- line, then the prompt" } }
   end
   local out = {}
+  local model = s.fields.model and s.fields.model.value or defaults.model
+  local codex_warning = values.codex_warning or ""
   for _, key in ipairs(CHECKED) do
-    local f, allowed = s.fields[key], values[key] or {}
+    local f = s.fields[key]
     local value = f and f.value or defaults[key]
-    local full_model_id = key == "model" and value and (value:match("^claude%-") or value:match("^gpt%-"))
-    if #allowed > 0 and not vim.tbl_contains(allowed, value) and not full_model_id then
+    local allowed = key == "effort" and vim.tbl_map(function(l) return l[1] end, levels(model)) or values[key] or {}
+    -- claude takes any full model name; a gpt- one is codex's to know, unless its catalog could not be read
+    local known = key == "model" and value and (models[value] or value:match("^claude%-")
+      or value:match("^gpt%-") and codex_warning ~= "")
+    if #allowed > 0 and not vim.tbl_contains(allowed, value) and not known then
       table.insert(out, { lnum = f and f.lnum or s.bars[1], col = f and f.col or 0, severity = ERROR,
-        message = ("%s: %s is not one of %s"):format(key, value ~= "" and value or "(empty)", table.concat(allowed, " ")) })
+        message = ("%s: %s is not one of %s%s"):format(key, value ~= "" and value or "(empty)", table.concat(allowed, " "),
+          key == "effort" and (" (what %s supports)"):format(model) or "") })
     end
+  end
+  local m = models[model]
+  if codex_warning ~= "" and s.fields.model and (m and m.provider == "codex" or (model or ""):match("^gpt%-")) then
+    table.insert(out, { lnum = s.fields.model.lnum, col = s.fields.model.col, severity = WARN, message = codex_warning })
   end
   local skills = s.fields.skills
   for skill in (skills and skills.value or ""):gmatch("[^,%s]+") do
@@ -244,6 +260,12 @@ local function candidates()
   local start = #before - #before:match("[^,%s:]*$")
   if key == "skills" then return skills(start) end
   local out = {}
+  if key == "effort" then -- only what the chosen model supports, each level described
+    for _, l in ipairs(levels(s.fields.model and s.fields.model.value or defaults.model)) do
+      table.insert(out, { word = l[1], insert = quoted(l[1]), info = l[2], doc = l[2] })
+    end
+    return start, out
+  end
   for _, value in ipairs(values[key] or {}) do
     local preset, info = presets[value], ""
     if key == "preset" and preset then
@@ -254,8 +276,9 @@ local function candidates()
       end
       if preset.prompt ~= "" then table.insert(sets, "first prompt: " .. vim.split(preset.prompt, "\n")[1]) end
       info = table.concat(sets, " · ")
-    elseif key == "model" and (values.codex or {})[value] then
-      info = "codex: " .. values.codex[value]
+    elseif key == "model" and models[value] then
+      local m = models[value]
+      info = (m.provider == "codex" and ("codex %s · "):format(m.id) or "") .. m.description
     end
     table.insert(out, { word = value, insert = quoted(value), info = info, doc = info })
   end
@@ -271,7 +294,7 @@ if ok_cmp then
   function source:complete(_, callback)
     local _, found = candidates()
     callback({ isIncomplete = false, items = vim.tbl_map(function(c)
-      return { label = c.word, insertText = c.insert, labelDetails = { description = c.info:sub(1, 40) },
+      return { label = c.word, insertText = c.insert, labelDetails = { description = c.info:sub(1, 60) },
         documentation = c.doc ~= "" and { kind = "markdown", value = c.doc } or nil }
     end, found or {}) })
   end
@@ -287,7 +310,7 @@ else
     for _, c in ipairs(found or {}) do table.insert(words, c.word); by_word[c.word] = c end
     return vim.tbl_map(function(w)
       local c = by_word[w]
-      return { word = c.insert or w, abbr = w, menu = c.info:sub(1, 40), info = c.info }
+      return { word = c.insert or w, abbr = w, menu = c.info:sub(1, 60), info = c.info }
     end, base == "" and words or vim.fn.matchfuzzy(words, base))
   end
   vim.bo[buf].omnifunc = "v:lua.handoff_complete"

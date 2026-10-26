@@ -10,17 +10,19 @@ pane's shell, whose ~/.claude/sessions/<pid>.json names the session id and cwd. 
 out in full to ~/.cache/handoff/, wrapped in <previous-session> so the new agent reads it as context, not
 as instructions. A pane with no Claude hands over its scrollback instead.
 
-Then a popup opens nvim on a launch buffer, laid out like git's commit buffer:
+Then a popup opens nvim on a launch buffer: markdown with YAML frontmatter, which any YAML parser reads
+the way parse_buffer does.
 
-    the new session's first prompt; /name anywhere in it loads that skill
-    ━━━━━━━━
-    model:  opus        every field, in handoff.toml's order; the ones it does not show are in the
-    preset: auto        file too, hidden by handoff-buffer.lua, so the file holds every value
+    ---                   drawn as a full-width bar
+    model:  opus          every field, in handoff.toml's order; the ones it does not show are in the
+    preset: auto          file too, hidden by handoff-buffer.lua, so the file holds every value
 
-    detected skills: …  the prompt's /names and the preset's skills; drawn, never read
-    ━━━━━━━━
+    # detected skills: …  the prompt's /names and the preset's skills; drawn without its #, never read
 
-    # lines starting with # are dropped: what each field accepts and means
+    # what each field accepts and means: YAML comments, so no parser reads them
+    ---
+
+    the new session's first prompt, markdown; /name anywhere in it loads that skill
 
 A preset (handoff-presets.md, laid out the same way) fills in the fields it sets; handoff-buffer.lua does
 that as you type, with completion and checks. :wq launches claude in a new window with those settings and
@@ -42,12 +44,15 @@ from datetime import datetime
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import yaml  # PyYAML, Ubuntu's python3-yaml
+
 HOME = Path.home()
 OUT = HOME / ".cache/handoff"
 SKILLS = HOME / ".claude/skills"
 CONFIG = Path(__file__).parent.parent / "handoff.toml"
 PRESETS = Path(__file__).parent.parent / "handoff-presets.md"
-BAR = "━" * 40  # handoff-buffer.lua draws it across the window; any line of ━ alone is a bar
+# Words YAML 1.1 (PyYAML's default loader) reads as booleans or null: a field holding one is written quoted.
+YAML_WORDS = {"y", "yes", "n", "no", "true", "false", "on", "off", "null", "~"}
 # A /name: after a space, a bracket or a quote, so "and/or" is not one. A known skill only, and not when
 # a / follows (/mnt/c is a path). handoff-buffer.lua matches the same way.
 SKILL_NAME = re.compile(r"(?<![^\s(\"'])/([A-Za-z0-9_][A-Za-z0-9_.:-]*)")
@@ -196,7 +201,8 @@ def presets(auto):
         text = PRESETS.read_text()
     except OSError:
         return found
-    for m in re.finditer(r"^## ([^\n]+)\n(.*?)(?=^## |\Z)", text, re.M | re.S):
+    # a preset starts at a `## name` with --- under it, so a ## heading in its prompt stays in the prompt
+    for m in re.finditer(r"^## ([^\n]+)\n(---\n.*?)(?=^## [^\n]+\n---\n|\Z)", text, re.M | re.S):
         found[m[1].strip()] = parse_buffer(m[2])
     return found
 
@@ -241,9 +247,12 @@ def codex_models():
 
 def problems(fields, values):
     """Field values that would make a bad launch; the Lua side checks the same rules as you type."""
-    bad = []
+    bad = [f"{key}: {value!r} is a YAML list or map; write it as one line of text"
+           for key, value in fields.items() if not isinstance(value, str)]
     for key in ("model", "effort", "preset", "others", "old"):
         value, allowed = fields.get(key, ""), values.get(key) or []
+        if not isinstance(value, str):
+            continue
         full_model_id = key == "model" and value.startswith(("claude-", "gpt-"))
         if allowed and value not in allowed and not full_model_id:
             bad.append(f"{key}: {value or '(empty)'} is not one of {' '.join(allowed)}")
@@ -261,16 +270,24 @@ def press(cwd, chosen, values):
             "skill_docs": skill_docs()}
 
 
+def yaml_value(value):
+    """value as YAML reads it back as that string: plain, or double-quoted where YAML would read a boolean,
+    null, number or date, or stop at a # or : in it. handoff-buffer.lua quotes by the same rule."""
+    ambiguous = (not value or value.lower() in YAML_WORDS or re.match(r"[-+.\d\[\]{}#&*!|>'\"%@`,?:]", value)
+                 or ": " in value or " #" in value)
+    return json.dumps(value, ensure_ascii=False) if ambiguous else value
+
+
 def row(key, value):
-    return f"{key + ':':<8}{value}".rstrip()  # handoff-buffer.lua writes fields the same way
+    return f"{key + ':':<8}{yaml_value(value)}"  # handoff-buffer.lua writes fields the same way
 
 
 def detected_line(skills):
-    return "detected skills: " + (" ".join(skills) or "(none)")
+    return "# detected skills: " + (" ".join(skills) or "(none)")
 
 
 def comment_block(p, seen):
-    """The # lines under the second bar: handoff.toml's words, then each field with its values."""
+    """The # lines at the end of the frontmatter: handoff.toml's words, then each field with its values."""
     cfg, show = p["config"], p["config"]["show"]
     short_models = [m for m in p["model"] if not m.startswith(("claude-", "gpt-"))]
     accepts = {"model": " ".join(short_models) or "could not read claude --help"}
@@ -293,19 +310,20 @@ def comment_block(p, seen):
 
 
 def render(p, seen):
-    """The buffer as it opens: an empty prompt, a bar, every field (the hidden ones too), the detected
-    skills a blank line below them, a bar, and the # block a blank line below that. Opening it in nvim and
+    """The buffer as it opens: the frontmatter (every field, the hidden ones too, then the detected skills
+    and the # block, each a blank line apart), a blank line, and an empty prompt. Opening it in nvim and
     writing it changes nothing."""
     d = p["defaults"]
     return "\n".join([
-        "",
-        BAR,
+        "---",
         *(row(key, d.get(key, "")) for key in p["order"]),
         "",
         detected_line(detected("", d.get("skills", ""), set(p["skill_docs"]))),
-        BAR,
         "",
         *comment_block(p, seen),
+        "---",
+        "",
+        "",
     ]) + "\n"
 
 
@@ -337,7 +355,8 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     chosen, seen = skill_defaults(pane_path, transcript)
     p = press(pane_path, chosen, allowed_values())
     buffer = stem.with_suffix(".launch.md")
-    buffer.write_text(render(p, seen))
+    text = render(p, seen)
+    buffer.write_text(text)
     stem.with_suffix(".launch.values.json").write_text(json.dumps(p))  # read by handoff-buffer.lua
     stem.with_suffix(".launch.json").write_text(json.dumps({
         "dir": pane_path, "session": session_id, "client": client, "transcript": str(exported),
@@ -349,23 +368,29 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     run = (f"if {shlex.join(edit)}; then {shlex.join([sys.executable, __file__, '--launch', str(buffer)])}; "
            f"else {shlex.join(aborted)}; fi")
     # -EE: the popup closes only on success, so a failed launch or a traceback stays readable.
-    tmux("display-popup", "-c", client, "-w", "80%", "-h", "60%", "-d", pane_path,
+    # Tall enough for the whole frontmatter and some prompt, so the fields are on screen with the cursor
+    # below them; list-clients, as display -c reads some other client.
+    rows = [int(h) for c, h in (line.rsplit(" ", 1) for line in tmux("list-clients", "-F", "#{client_name} #{client_height}")
+                                .splitlines()) if c == client]
+    height = str(min(text.count("\n") + 10, rows[0] - 2)) if rows else "90%"
+    tmux("display-popup", "-c", client, "-w", "80%", "-h", height, "-d", pane_path,
          "-T", " handoff: :wq launches, :cq aborts ", "-EE", run)
 
 
 def parse_buffer(text):
-    """(fields, prompt). Lines starting with # are dropped first, as in git's commit buffer. The prompt is
-    the text above the first bar; the fields are the `key: value` lines from there to the second bar, with a
-    one-word key, so "detected skills:" is not one. That line is never read: launch() works the skills out
-    again from the prompt and skills:. Nothing after the second bar is read either."""
-    lines = [line for line in text.splitlines() if not line.startswith("#")]
-    bars = [i for i, line in enumerate(lines) if line and set(line) == {"━"}] + [len(lines)] * 2
-    fields = {}
-    for line in lines[bars[0] + 1:bars[1]]:
-        key, sep, value = line.partition(":")
-        if sep and key.isalnum():  # handoff-buffer.lua: ^%w+:
-            fields[key] = value.strip()
-    return fields, "\n".join(lines[:bars[0]]).strip()
+    """(fields, prompt): the frontmatter read as YAML, and the markdown after it as the prompt, # headings
+    and all. BaseLoader reads every value as text, so a bare off stays "off" and an empty one "", and no
+    value can break a launch; the writers quote those, so YAML's default loader reads the same. The
+    frontmatter's comments, the help and the detected skills line, are YAML's to drop: launch() works the
+    skills out again from the prompt and skills:."""
+    m = re.match(r"---\n(.*?)^---$\n?(.*)", text, re.S | re.M)
+    try:
+        data = yaml.load(m[1], Loader=yaml.BaseLoader) if m else None
+    except yaml.YAMLError:
+        data = None
+    if not isinstance(data, dict):
+        return {}, (m[2] if m else text).strip()
+    return data, m[2].strip()
 
 
 def detected(prompt, skills, known):
@@ -395,7 +420,7 @@ def launch(buffer):
     fields, note = parse_buffer(buffer.read_text())
     values = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.values.json")).read_text())
     # the buffer refuses to write these; this catches :q on an unedited bad buffer
-    bad = ["no ━ bar under the prompt, so no fields"] if not fields else []
+    bad = ["no YAML frontmatter (--- lines) above the prompt, so no fields"] if not fields else []
     fields = {**values.get("defaults", {}), **fields}  # a field line deleted by hand keeps its default
     bad = bad or problems(fields, values)
     if bad:

@@ -2,7 +2,7 @@
 # they start as, and the words in its # block. Presets are in handoff-presets.md. Read on every
 # press, so a change here shows on the next one.
 
-# Shown in this order between the two bars. A field left out is still in the file, hidden (nvim
+# Shown in this order in the frontmatter. A field left out is still in the file, hidden (nvim
 # does not draw it), and keeps its default or what the preset sets.
 show = ["model", "effort", "preset", "old"]
 
@@ -28,9 +28,10 @@ name = "shown in the prompt box and /resume (claude only)"
 # The top of the # block. {seen}: other skills loaded in this directory.
 [text]
 top = """
-Write the new session's first prompt above the first bar; /name anywhere in it
-loads that skill. Lines starting with # are dropped. An empty prompt starts the
-session with the transcript as context only.
+The new session's first prompt goes below the closing ---, as markdown: /name
+anywhere in it loads that skill, and # there starts a heading. Up here, # lines
+are YAML comments and are dropped. An empty prompt starts the session with the
+transcript as context only.
 :wq launches, :cq aborts. Tab completes a field or a /name; gf opens a skill's SKILL.md.
 Also loaded in this directory: {seen}
 """

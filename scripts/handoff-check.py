@@ -17,6 +17,8 @@ import sys
 import tempfile
 import time
 import unittest
+
+import yaml
 from functools import cache
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -54,9 +56,10 @@ def default_buffer(project="/home/lucas/pin"):
 
 
 def presets():
-    """{name: its section} from handoff-presets.md; each `## name` heading starts one."""
+    """{name: its section} from handoff-presets.md; each `## name` heading with --- under it starts one."""
     text = PRESETS.read_text()
-    return {m[1].strip(): m[2].strip("\n") for m in re.finditer(r"^## ([^\n]+)\n(.*?)(?=^## |\Z)", text, re.M | re.S)}
+    return {m[1].strip(): m[2].strip("\n")
+            for m in re.finditer(r"^## ([^\n]+)\n(---\n.*?)(?=^## [^\n]+\n---\n|\Z)", text, re.M | re.S)}
 
 
 class Server:
@@ -163,7 +166,7 @@ class PresetsFile(unittest.TestCase):
         for name, section in presets().items():
             with self.subTest(preset=name):
                 fields, _ = handoff.parse_buffer(section)
-                self.assertTrue(fields, "no fields read: the ━ bar above them is missing")
+                self.assertTrue(fields, "no fields read: its frontmatter is missing")
                 self.assertLessEqual(set(fields), set(defaults), "a field the launch buffer does not have")
                 self.assertEqual(handoff.problems({**defaults, **fields}, live_values()), [])
 
@@ -220,13 +223,41 @@ class Preset(unittest.TestCase):
 
 
 class Buffer(unittest.TestCase):
-    """What launch reads from buffer v2: the prompt above the first bar, the fields between the bars."""
+    """What launch reads from the buffer: the fields in its YAML frontmatter, the prompt in the markdown after it."""
 
-    def test_comment_lines_and_bars_never_reach_the_prompt(self):
-        fields, prompt = handoff.parse_buffer(f"do this\n# not this\nthen that\n{handoff.BAR}\nmodel: opus\n\n"
-                                              f"detected skills: perf\n{handoff.BAR}\n\n# the end\n")
-        self.assertEqual(prompt, "do this\nthen that")
-        self.assertEqual(fields, {"model": "opus"})
+    def test_frontmatter_comments_drop_and_body_headings_stay(self):
+        fields, prompt = handoff.parse_buffer("---\nmodel: opus\nothers: off\n\n# detected skills: perf\n\n# help\n---\n\n"
+                                              "do this\n## Task\nthen that\n")
+        self.assertEqual(prompt, "do this\n## Task\nthen that")
+        self.assertEqual(fields, {"model": "opus", "others": "off"})  # a bare off stays text
+
+    def test_a_heading_in_the_prompt_reaches_claude(self):
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            buf = s.buffer("", project)
+            press(buf, project)
+            run = edit(buf, "call setline('$', '## Task')", "call append('$', 'fix the badge')")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            argv = s.launch(buf)
+        self.assertTrue(argv[-1].startswith("## Task\nfix the badge\n\nThe previous session's"), argv[-1])
+
+    def test_yaml_reads_the_frontmatter_as_parse_buffer_does(self):
+        """PyYAML's default loader on files both writers produced: handoff.py's, then handoff-buffer.lua's
+        after it filled in red-team and none (skills: "")."""
+        for value in [*VALUES["model"], *VALUES["effort"], *VALUES["others"], "keep", "close", "", "auto", "none",
+                      "red-team", "obsidian perf", "pin-2", "5.5", "2026-10-25"]:
+            self.assertEqual(yaml.safe_load(handoff.row("k", value)), {"k": value}, handoff.row("k", value))
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = Path(tmp) / "pin.launch.md"
+            for preset in (None, "red-team", "none"):
+                with self.subTest(preset=preset):
+                    press(buf)
+                    if preset:
+                        self.assertEqual(choose(buf, preset).returncode, 0)
+                    text = buf.read_text()
+                    _, frontmatter, _ = text.split("---\n", 2)
+                    self.assertEqual(yaml.safe_load(frontmatter), handoff.parse_buffer(text)[0])
 
     def test_a_slash_name_loads_its_skill_and_the_written_line_is_not_read(self):
         with Server() as s:
@@ -235,7 +266,7 @@ class Buffer(unittest.TestCase):
             buf = s.buffer("", project)
             press(buf, project)
             text = buf.read_text().replace("detected skills: obsidian perf", "detected skills: debug", 1)
-            buf.write_text("take a /screenshot of /mnt/c/x" + text)
+            buf.write_text(text + "take a /screenshot of /mnt/c/x\n")
             argv = s.launch(buf)
         self.assertTrue(argv[-1].startswith("take a /screenshot of /mnt/c/x\n\nThe previous session's"), argv[-1])
         self.assertTrue(argv[-1].endswith(" Load these skills: screenshot, obsidian, perf."), argv[-1])
@@ -248,7 +279,7 @@ class Buffer(unittest.TestCase):
             project.mkdir()
             buf = s.buffer("", project)
             press(buf, project)
-            run = edit(buf, f"call setline(1, {typed!r})")
+            run = edit(buf, f"call setline('$', {typed!r})")
             self.assertEqual(run.returncode, 0, run.stderr)
             loaded = [n for n in ("share", "screenshot") if n in VALUES["skills"]] + ["obsidian", "perf"]  # share is one now
             self.assertIn(f"detected skills: {' '.join(loaded)}\n", buf.read_text())
@@ -269,7 +300,7 @@ class Codex(unittest.TestCase):
             project.mkdir()
             buf = s.buffer("", project)
             press(buf, project)
-            run = edit(buf, "%s/^model:.*/model:  astra/", "%s/^effort:.*/effort: max/", "call setline(1, 'review the badge')")
+            run = edit(buf, "%s/^model:.*/model:  astra/", "%s/^effort:.*/effort: max/", "call setline('$', 'review the badge')")
             self.assertEqual(run.returncode, 0, run.stderr)
             argv = s.launch(buf)
         self.assertEqual(s.ran, "codex")

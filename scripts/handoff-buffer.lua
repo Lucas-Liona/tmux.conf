@@ -1,5 +1,6 @@
--- The handoff launch buffer (handoff.py opens it with +luafile): the prompt on top, the fields and the
--- detected skills between two bars, and # lines that launch drops. What it needs comes from
+-- The handoff launch buffer (handoff.py opens it with +luafile): markdown with YAML frontmatter. The fields,
+-- the detected skills and the help (YAML # comments) sit between two --- lines drawn as bars; the prompt is
+-- the markdown below them. What it needs comes from
 -- <stem>.launch.values.json, which handoff.py writes fresh on every press: handoff.toml, the presets, and
 -- each skill's description and path. Everything here is buffer-local; ~/.config/nvim is not touched.
 local buf = vim.api.nvim_get_current_buf()
@@ -15,33 +16,53 @@ for _, skill in ipairs(values.skills) do known[skill] = true end
 for skill in pairs(docs) do known[skill] = true end
 for _, key in ipairs(values.config.show) do shown[key] = true end
 
--- Not markdown: its # lines would be drawn as headings.
-vim.bo[buf].filetype = "handoff"
-pcall(vim.treesitter.stop, buf)
-vim.cmd([[syntax match handoffComment /^#.*/ | highlight default link handoffComment Comment]])
+-- The file is .launch.md, so nvim opens it as markdown: # in the prompt is a heading, and the frontmatter
+-- gets YAML highlighting. What markdown would draw wrong is drawn over in paint().
 
-local function is_bar(line) return line ~= "" and line:gsub("━", "") == "" end
-local function row(key, value) return (("%-8s%s"):format(key .. ":", value):gsub("%s+$", "")) end -- as handoff.py's
+-- Words YAML 1.1 reads as booleans or null, as in handoff.py.
+local YAML_WORDS = { y = 1, yes = 1, n = 1, no = 1, ["true"] = 1, ["false"] = 1, on = 1, off = 1, null = 1, ["~"] = 1 }
+local function needs_quotes(v)
+  return v == "" or YAML_WORDS[v:lower()] or v:match("^[%-%+%.%d%[%]{}#&*!|>'\"%%@`,?:]") or v:find(": ", 1, true)
+    or v:find(" #", 1, true)
+end
+-- A field line YAML reads back as the same string; handoff.py's row() and yaml_value(), same rule.
+local function quoted(v) return needs_quotes(v) and ('"' .. v:gsub('[\\"]', "\\%0") .. '"') or v end
+local function row(key, value) return ("%-8s%s"):format(key .. ":", quoted(value)) end
+-- A YAML scalar as parse_buffer's BaseLoader reads it, always text: a quoted one unquoted, a plain one up
+-- to its # comment, so a bare off is "off".
+local function scalar(raw)
+  raw = vim.trim(raw)
+  local dq, sq = raw:match('^"(.*)"$'), raw:match("^'(.*)'$")
+  if dq then return (dq:gsub("\\(.)", "%1")) end
+  if sq then return (sq:gsub("''", "'")) end
+  return vim.trim((raw:gsub("%s#.*$", "")))
+end
 
--- The buffer by line (0-based), read the way handoff.py's parse_buffer reads it: # lines dropped, the prompt
--- above the first bar, `key: value` fields up to the second. Also where the detected skills line and the
--- last field are.
+-- The buffer by line (0-based), read the way handoff.py's parse_buffer reads it: the frontmatter between a
+-- first-line --- and the next --- (its fields; its # comments, the detected skills line among them), then
+-- the prompt, all of what follows. No frontmatter: all of it is the prompt.
 local function shape()
-  local s, prompt = { bars = {}, fields = {}, prompt_lines = {} }, {}
-  for i, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    if line:sub(1, 1) == "#" then
-    elseif is_bar(line) and #s.bars < 2 then
-      table.insert(s.bars, i - 1)
-    elseif #s.bars == 0 then
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local s, prompt = { bars = {}, fields = {}, comments = {}, prompt_lines = {} }, {}
+  if lines[1] == "---" then
+    for i = 2, #lines do
+      if lines[i] == "---" then s.bars = { 0, i - 1 }; break end
+    end
+  end
+  for i, line in ipairs(lines) do
+    local lnum = i - 1
+    if not s.bars[2] or lnum > s.bars[2] then
       table.insert(prompt, line)
-      table.insert(s.prompt_lines, { lnum = i - 1, text = line })
-    elseif #s.bars == 1 and line:match("^detected skills:") then
-      s.detected = s.detected or i - 1
-    elseif #s.bars == 1 then
+      table.insert(s.prompt_lines, { lnum = lnum, text = line })
+    elseif lnum > 0 and lnum < s.bars[2] and line:match("^# detected skills:") then
+      s.detected = s.detected or lnum
+    elseif lnum > 0 and lnum < s.bars[2] and line:match("^%s*#") then
+      table.insert(s.comments, lnum)
+    elseif lnum > 0 and lnum < s.bars[2] then
       local key, rest = line:match("^(%w+):(.*)$")
       if key then
-        s.fields[key] = { lnum = i - 1, col = #key + 1 + #rest:match("^%s*"), value = vim.trim(rest) }
-        s.last_field = i - 1
+        s.fields[key] = { lnum = lnum, col = #key + 1 + #rest:match("^%s*"), value = scalar(rest) }
+        s.last_field = lnum
       end
     end
   end
@@ -91,23 +112,23 @@ local function apply(from, to)
       if s.fields[key] then
         set_lines(s.fields[key].lnum, s.fields[key].lnum + 1, { row(key, value) })
       elseif s.bars[2] then
-        local after = (s.last_field or s.bars[1]) + 1
+        local after = (s.last_field or 0) + 1
         set_lines(after, after, { row(key, value) })
       end
     end
   end
   local s = shape()
   if s.prompt == "" or s.prompt == vim.trim(old.prompt) then
-    set_lines(0, s.bars[1], new.prompt ~= "" and vim.split(vim.trim(new.prompt), "\n") or { "" })
+    set_lines(s.bars[2] + 1, -1, { "", unpack(new.prompt ~= "" and vim.split(vim.trim(new.prompt), "\n") or { "" }) })
   elseif new.prompt ~= "" then
     notice(("kept your prompt; %s's own is in handoff-presets.md"):format(to))
   end
 end
 
 local function problems(s)
-  if #s.bars < 2 then
+  if not s.bars[2] then
     return { { lnum = 0, col = 0, severity = ERROR,
-      message = "two ━ bars are needed: the prompt above the first, the fields between them" } }
+      message = "the fields need their frontmatter: a --- first line, the fields, a --- line, then the prompt" } }
   end
   local out = {}
   for _, key in ipairs(CHECKED) do
@@ -141,7 +162,8 @@ local function problems(s)
   return out
 end
 
--- The bars across the window, hidden fields not drawn, the detected skills marked frozen, and a
+-- The --- lines as bars across the window, the frontmatter's # comments as comments (markdown's YAML would
+-- not dim them all), hidden fields not drawn, the detected skills without their # and marked frozen, and a
 -- placeholder in an empty prompt.
 local function paint(s)
   vim.api.nvim_buf_clear_namespace(buf, draw, 0, -1)
@@ -153,17 +175,23 @@ local function paint(s)
     vim.api.nvim_buf_set_extmark(buf, draw, lnum, 0,
       { virt_text = { { ("━"):rep(width), "FloatBorder" } }, virt_text_pos = "overlay" })
   end
+  local function line_len(lnum) return #vim.api.nvim_buf_get_lines(buf, lnum, lnum + 1, false)[1] end
+  for _, lnum in ipairs(s.comments) do
+    vim.api.nvim_buf_set_extmark(buf, draw, lnum, 0, { end_col = line_len(lnum), hl_group = "Comment" })
+  end
   for key, f in pairs(s.fields) do
     if not shown[key] then vim.api.nvim_buf_set_extmark(buf, draw, f.lnum, 0, { conceal_lines = "" }) end
   end
   if s.detected then
-    vim.api.nvim_buf_set_extmark(buf, draw, s.detected, 0, { end_col = #"detected skills:", hl_group = "Comment" })
-    vim.api.nvim_buf_set_extmark(buf, draw, s.detected, #"detected skills:",
-      { end_col = #vim.api.nvim_buf_get_lines(buf, s.detected, s.detected + 1, false)[1], hl_group = "Special" })
+    local label = #"# detected skills:"
+    vim.api.nvim_buf_set_extmark(buf, draw, s.detected, 0, { end_col = 2, conceal = "" })
+    vim.api.nvim_buf_set_extmark(buf, draw, s.detected, 2, { end_col = label, hl_group = "Comment" })
+    vim.api.nvim_buf_set_extmark(buf, draw, s.detected, label, { end_col = line_len(s.detected), hl_group = "Special" })
   end
-  if s.prompt == "" and s.bars[1] > 0 and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "" then
-    vim.api.nvim_buf_set_extmark(buf, draw, 0, 0, { virt_text_pos = "overlay",
-      virt_text = { { "your prompt; /name anywhere loads a skill. The # lines at the bottom say the rest.", "Comment" } } })
+  local first = s.prompt_lines[2] or s.prompt_lines[1] -- under the blank line after the closing ---
+  if s.prompt == "" and first then
+    vim.api.nvim_buf_set_extmark(buf, draw, first.lnum, 0, { virt_text_pos = "overlay",
+      virt_text = { { "your prompt, in markdown; /name anywhere loads a skill. The # lines above say the rest.", "Comment" } } })
   end
 end
 
@@ -179,8 +207,9 @@ local function sync()
     s = shape()
   end
   if s.bars[2] then
-    local line = "detected skills: " .. (#detected(s) > 0 and table.concat(detected(s), " ") or "(none)")
-    if s.detected then set_lines(s.detected, s.detected + 1, { line }) else set_lines(s.bars[2], s.bars[2], { "", line }) end
+    local line = "# detected skills: " .. (#detected(s) > 0 and table.concat(detected(s), " ") or "(none)")
+    local after = (s.last_field or 0) + 1
+    if s.detected then set_lines(s.detected, s.detected + 1, { line }) else set_lines(after, after, { "", line }) end
     s = shape()
   end
   paint(s)
@@ -205,13 +234,13 @@ local function candidates()
     table.sort(out, function(a, b) return a.word < b.word end)
     return start, out
   end
-  if s.bars[1] and lnum - 1 < s.bars[1] then
+  if not s.bars[2] or lnum - 1 > s.bars[2] then
     local start = before:match("^()/[%w_%.:%-]*$") or before:match("[%s(\"']()/[%w_%.:%-]*$")
     if start then return skills(start) end -- start is the /, 1-based: the word begins right after it
     return
   end
   local key = before:match("^(%w+):")
-  if not key or not s.fields[key] or s.bars[2] and lnum - 1 > s.bars[2] then return end
+  if not key or not s.fields[key] or lnum - 1 >= s.bars[2] then return end
   local start = #before - #before:match("[^,%s:]*$")
   if key == "skills" then return skills(start) end
   local out = {}
@@ -228,7 +257,7 @@ local function candidates()
     elseif key == "model" and (values.codex or {})[value] then
       info = "codex: " .. values.codex[value]
     end
-    table.insert(out, { word = value, info = info, doc = info })
+    table.insert(out, { word = value, insert = quoted(value), info = info, doc = info })
   end
   return start, out
 end
@@ -242,7 +271,7 @@ if ok_cmp then
   function source:complete(_, callback)
     local _, found = candidates()
     callback({ isIncomplete = false, items = vim.tbl_map(function(c)
-      return { label = c.word, labelDetails = { description = c.info:sub(1, 40) },
+      return { label = c.word, insertText = c.insert, labelDetails = { description = c.info:sub(1, 40) },
         documentation = c.doc ~= "" and { kind = "markdown", value = c.doc } or nil }
     end, found or {}) })
   end
@@ -254,11 +283,12 @@ else
   function _G.handoff_complete(findstart, base)
     local start, found = candidates()
     if findstart == 1 then return start or -3 end -- -3: cancel quietly
-    local words = vim.tbl_map(function(c) return c.word end, found or {})
-    local info = {}
-    for _, c in ipairs(found or {}) do info[c.word] = c.info end
-    return vim.tbl_map(function(w) return { word = w, menu = info[w]:sub(1, 40), info = info[w] } end,
-      base == "" and words or vim.fn.matchfuzzy(words, base))
+    local words, by_word = {}, {}
+    for _, c in ipairs(found or {}) do table.insert(words, c.word); by_word[c.word] = c end
+    return vim.tbl_map(function(w)
+      local c = by_word[w]
+      return { word = c.insert or w, abbr = w, menu = c.info:sub(1, 40), info = c.info }
+    end, base == "" and words or vim.fn.matchfuzzy(words, base))
   end
   vim.bo[buf].omnifunc = "v:lua.handoff_complete"
 end
@@ -314,11 +344,14 @@ vim.api.nvim_create_autocmd("BufWriteCmd", {
 })
 
 sync()
--- The cursor starts in the prompt, in insert mode, and again once the UI is up: Lucas's 18:12 press
--- opened somewhere else with a UI attached, which no throwaway server reproduced.
+-- The cursor starts on the prompt's first line, under the blank one after the closing ---, in insert mode;
+-- and again once the UI is up: Lucas's 18:12 press opened somewhere else with a UI attached, which no
+-- throwaway server reproduced.
 local function to_prompt()
   if vim.api.nvim_get_current_buf() == buf then
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    local s = shape()
+    local first = s.prompt_lines[2] or s.prompt_lines[1]
+    vim.api.nvim_win_set_cursor(0, { first and first.lnum + 1 or 1, 0 })
     vim.cmd.startinsert()
   end
 end

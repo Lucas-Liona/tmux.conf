@@ -17,13 +17,13 @@ name = "{dir}-2"  # {dir}: the name of the pane's directory
 
 # One line per field in the # block. {values} is what the field accepts today.
 [help]
-model = "{values}, or a full claude-… id"
-effort = "{values}"
+model = "{values}, or a full claude-… or gpt-… id; astra, sol, luna and gpt-… start codex"
+effort = "{values}; on codex, max is xhigh"
 preset = "what each one sets (auto: the two skills loaded most here, and the old session's):"
 old = "keep leaves the old session running; close ends it once it is idle"
 skills = "the preset's skills, added to the prompt's /names"
-others = "what every other skill in ~/.claude/skills becomes: {values}"
-name = "shown in the prompt box and /resume"
+others = "what every other skill in ~/.claude/skills becomes: {values} (claude only)"
+name = "shown in the prompt box and /resume (claude only)"
 
 # The top of the # block. {seen}: other skills loaded in this directory.
 [text]

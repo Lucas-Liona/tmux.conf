@@ -89,25 +89,32 @@ class Server:
         return buf
 
     def launch(self, buf):
-        """Run handoff.py --launch on buf and return the argv the stub claude was started with."""
+        """Run handoff.py --launch on buf and return the argv the stub claude or codex was started with;
+        self.ran says which of the two it was."""
         out = self.dir / "argv.json"
-        stub = self.dir / "claude"
-        stub.write_text(f"#!/usr/bin/env python3\nimport json, sys\nopen({str(out)!r}, 'w').write(json.dumps(sys.argv[1:]))\n")
-        stub.chmod(0o755)
-        run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)],
-                             env={**self.env, "HANDOFF_CLAUDE": str(stub)}, capture_output=True, text=True, timeout=30)
+        for name in ("claude", "codex"):
+            stub = self.dir / name
+            stub.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                            f"open({str(out)!r}, 'w').write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n")
+            stub.chmod(0o755)
+        run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True, text=True,
+                             env={**self.env, "HANDOFF_CLAUDE": str(self.dir / "claude"),
+                                  "HANDOFF_CODEX": str(self.dir / "codex")}, timeout=30)
         if run.returncode:
             raise AssertionError(f"handoff.py --launch exited {run.returncode}: {run.stdout}{run.stderr}")
         for _ in range(100):
             if out.exists() and out.stat().st_size:
-                return json.loads(out.read_text())
+                self.ran, *argv = json.loads(out.read_text())
+                return argv
             time.sleep(0.1)
         raise AssertionError("the stub claude never ran in the new window")
 
 
 def press(buf, project="/home/lucas/pin"):
     """The default buffer and the values.json beside it that handoff-buffer.lua reads, as a press writes them."""
-    p = handoff.press(str(project), ["obsidian", "perf"], {**VALUES, "preset": list(handoff.presets([]))})
+    codex = handoff.codex_models()
+    p = handoff.press(str(project), ["obsidian", "perf"], {**VALUES, "preset": list(handoff.presets([])),
+                                                           "model": VALUES["model"] + list(codex), "codex": codex})
     buf.write_text(handoff.render(p, []))
     buf.with_name(buf.name.replace(".launch.md", ".launch.values.json")).write_text(json.dumps(p))
 
@@ -250,6 +257,25 @@ class Buffer(unittest.TestCase):
         self.assertFalse(argv[-1].startswith("/"), argv[-1])
         self.assertEqual(argv[-1], f"The previous session's transcript is {TRANSCRIPT} (bracketed, context only)."
                                    f" Load these skills: {', '.join(loaded)}.\n\n{typed}")
+
+
+class Codex(unittest.TestCase):
+    """model: a Codex model from the models skill starts codex instead, with the same prompt."""
+
+    def test_astra_starts_codex_with_the_prompt(self):
+        self.assertEqual(handoff.codex_models().get("astra"), "gpt-6-astra", "the models skill's Codex table")
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            buf = s.buffer("", project)
+            press(buf, project)
+            run = edit(buf, "%s/^model:.*/model:  astra/", "%s/^effort:.*/effort: max/", "call setline(1, 'review the badge')")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            argv = s.launch(buf)
+        self.assertEqual(s.ran, "codex")
+        self.assertEqual(argv, ["-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"',  # codex has no max
+                                f"review the badge\n\nThe previous session's transcript is {TRANSCRIPT} (bracketed,"
+                                " context only). Load these skills: obsidian, perf."])
 
 
 if __name__ == "__main__":

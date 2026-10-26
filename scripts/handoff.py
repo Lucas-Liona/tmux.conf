@@ -56,6 +56,9 @@ LUCAS_TAGS = ("<pasted_content", "<bash-input", "<bash-stdout")
 # skillOverrides' states have no code source to read; they are the table at
 # https://code.claude.com/docs/en/skills#skilloverrides (checked 2026-10-25).
 OVERRIDE_STATES = ["name-only", "on", "user-invocable-only", "off"]
+# Codex's model_reasoning_effort has no max: minimal low medium high xhigh, per
+# https://developers.openai.com/codex/config-sample (checked 2026-10-25).
+CODEX_EFFORT = {"max": "xhigh"}
 MODELS_SKILL = SKILLS / "models/SKILL.md"
 BUFFER_LUA = Path(__file__).with_name("handoff-buffer.lua")
 # panel.py already knows which "user" lines are Lucas and which are injected reminders; reuse that, unedited.
@@ -200,8 +203,8 @@ def presets(auto):
 
 def allowed_values():
     """What each field accepts, read fresh on every press: effort levels and model aliases from
-    `claude --help` and the models skill, skills from ~/.claude/skills. An empty list means "could not
-    read it", and that line is then not checked."""
+    `claude --help` and the models skill (Codex's too), skills from ~/.claude/skills. An empty list means
+    "could not read it", and that line is then not checked."""
     try:
         help_text = subprocess.run([claude_bin(), "--help"], capture_output=True, text=True, timeout=10).stdout
     except (OSError, TypeError, subprocess.TimeoutExpired):
@@ -214,8 +217,10 @@ def allowed_values():
                    for n in row]
     except OSError:
         pass
+    codex = codex_models()
     return {
-        "model": list(dict.fromkeys(models)),
+        "model": list(dict.fromkeys(models + list(codex))),
+        "codex": codex,
         "effort": [e.strip() for e in effort.group(1).split(",")] if effort else [],
         "skills": personal_skills(),
         "others": OVERRIDE_STATES,
@@ -224,12 +229,22 @@ def allowed_values():
     }
 
 
+def codex_models():
+    """{name: id} from the models skill's Codex table, | Astra | `gpt-6-astra` | ...: astra and gpt-6-astra
+    both name gpt-6-astra. A model here, or any gpt-... id, starts codex instead of claude."""
+    try:
+        rows = re.findall(r"^\| ([^|`]+?) \| `(gpt-[\w.-]+)` \|", MODELS_SKILL.read_text(), re.M)
+    except OSError:
+        return {}
+    return {name: model for label, model in rows for name in (label.split()[-1].lower(), model)}
+
+
 def problems(fields, values):
     """Field values that would make a bad launch; the Lua side checks the same rules as you type."""
     bad = []
     for key in ("model", "effort", "preset", "others", "old"):
         value, allowed = fields.get(key, ""), values.get(key) or []
-        full_model_id = key == "model" and value.startswith("claude-")
+        full_model_id = key == "model" and value.startswith(("claude-", "gpt-"))
         if allowed and value not in allowed and not full_model_id:
             bad.append(f"{key}: {value or '(empty)'} is not one of {' '.join(allowed)}")
     return bad
@@ -257,7 +272,7 @@ def detected_line(skills):
 def comment_block(p, seen):
     """The # lines under the second bar: handoff.toml's words, then each field with its values."""
     cfg, show = p["config"], p["config"]["show"]
-    short_models = [m for m in p["model"] if not m.startswith("claude-")]
+    short_models = [m for m in p["model"] if not m.startswith(("claude-", "gpt-"))]
     accepts = {"model": " ".join(short_models) or "could not read claude --help"}
     lines = cfg["text"]["top"].strip("\n").replace("{seen}", " ".join(seen) or "none").split("\n") + [""]
     for key in show:
@@ -360,11 +375,18 @@ def detected(prompt, skills, known):
     return list(dict.fromkeys([n for n in named if n in known] + [s for s in re.split(r"[,\s]+", skills) if s]))
 
 
+def newest(name):
+    """claude and codex come from nvm, which only the interactive shell puts on PATH: take the newest node's."""
+    return shutil.which(name) or max(map(str, HOME.glob(f".nvm/versions/node/*/bin/{name}")), default=None,
+                                     key=lambda p: [int(x) for x in re.findall(r"\d+", p.split("/node/")[1])[:3]])
+
+
 def claude_bin():
-    """claude comes from nvm, which only the interactive shell puts on PATH: take the newest node's."""
-    found = shutil.which("claude") or max(map(str, HOME.glob(".nvm/versions/node/*/bin/claude")), default=None,
-                                          key=lambda p: [int(x) for x in re.findall(r"\d+", p.split("/node/")[1])[:3]])
-    return os.environ.get("HANDOFF_CLAUDE") or found  # HANDOFF_CLAUDE: a stub, for checking
+    return os.environ.get("HANDOFF_CLAUDE") or newest("claude")  # HANDOFF_CLAUDE, HANDOFF_CODEX: stubs, for checking
+
+
+def codex_bin():
+    return os.environ.get("HANDOFF_CODEX") or newest("codex")
 
 
 def launch(buffer):
@@ -388,17 +410,23 @@ def launch(buffer):
         context += f" Load these skills: {', '.join(chosen)}."
     # A prompt starting with / would run as a slash command (`claude -p "/usage"` does), so the context goes first.
     prompt = (f"{context}\n\n{note}" if note.startswith("/") else f"{note}\n\n{context}") if note else context
-    claude = claude_bin()
-    argv = [claude, "--model", fields["model"], "--effort", fields["effort"]]
-    if fields.get("name"):
-        argv += ["-n", fields["name"]]
-    if overrides:
-        argv += ["--settings", json.dumps({"skillOverrides": overrides})]
-    argv.append(prompt)
+    codex = values.get("codex", {})
+    if fields["model"] in codex or fields["model"].startswith("gpt-"):
+        # Codex takes no name and no skillOverrides; it reads the same skills through ~/.agents/skills.
+        effort = CODEX_EFFORT.get(fields["effort"], fields["effort"])
+        argv = [codex_bin(), "-m", codex.get(fields["model"], fields["model"]),
+                "-c", f'model_reasoning_effort="{effort}"', prompt]
+    else:
+        argv = [claude_bin(), "--model", fields["model"], "--effort", fields["effort"]]
+        if fields.get("name"):
+            argv += ["-n", fields["name"]]
+        if overrides:
+            argv += ["--settings", json.dumps({"skillOverrides": overrides})]
+        argv.append(prompt)
 
-    # claude runs as the window's command, not typed into a shell; a shell takes over when it exits so the
-    # window stays. Its bin dir goes on PATH for what claude starts itself (npx MCP servers, node).
-    env_path = f"{Path(claude).parent}:{os.environ.get('PATH', '')}"
+    # claude or codex runs as the window's command, not typed into a shell; a shell takes over when it exits
+    # so the window stays. Its bin dir goes on PATH for what it starts itself (npx MCP servers, node).
+    env_path = f"{Path(argv[0]).parent}:{os.environ.get('PATH', '')}"
     made = subprocess.run(["tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", ctx["session"], "-c", ctx["dir"],
                            "-e", f"PATH={env_path}", "zsh", "-c", '"$0" "$@"; exec zsh', *argv],
                           capture_output=True, text=True)

@@ -113,7 +113,7 @@ local function problems(s)
   for _, key in ipairs(CHECKED) do
     local f, allowed = s.fields[key], values[key] or {}
     local value = f and f.value or defaults[key]
-    local full_model_id = key == "model" and value and value:match("^claude%-")
+    local full_model_id = key == "model" and value and (value:match("^claude%-") or value:match("^gpt%-"))
     if #allowed > 0 and not vim.tbl_contains(allowed, value) and not full_model_id then
       table.insert(out, { lnum = f and f.lnum or s.bars[1], col = f and f.col or 0, severity = ERROR,
         message = ("%s: %s is not one of %s"):format(key, value ~= "" and value or "(empty)", table.concat(allowed, " ")) })
@@ -225,6 +225,8 @@ local function candidates()
       end
       if preset.prompt ~= "" then table.insert(sets, "first prompt: " .. vim.split(preset.prompt, "\n")[1]) end
       info = table.concat(sets, " · ")
+    elseif key == "model" and (values.codex or {})[value] then
+      info = "codex: " .. values.codex[value]
     end
     table.insert(out, { word = value, info = info, doc = info })
   end

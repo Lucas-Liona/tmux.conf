@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Pins for prefix+T: the launch step as it works today, and the picker that will replace the nvim buffer.
+"""Pins for prefix+T: the launch step, the presets file, and the launch buffer's preset: field.
 
     python3 ~/.config/tmux/scripts/handoff-check.py
 
-The seam is the launch buffer (~/.cache/handoff/<stamp>.launch.md). Whatever edits it, nvim today or the
-picker next, rewrites it and exits 0 to launch or non-zero to abort; `handoff.py --launch` then reads it.
-Launches go to a throwaway tmux server and a stub claude, never the live server.
+The seam is the launch buffer (~/.cache/handoff/<stamp>.launch.md). Whatever edits it, nvim today or another
+front end later, rewrites it and exits 0 to launch or non-zero to abort; `handoff.py --launch` then reads it.
+Launches go to a throwaway tmux server and a stub claude, never the live server; nvim runs headless.
 """
 import importlib.util
 import json
@@ -24,7 +24,8 @@ from pathlib import Path
 sys.dont_write_bytecode = True  # importing handoff.py must not leave __pycache__ in the repo
 HERE = Path(__file__).resolve().parent
 HANDOFF = HERE / "handoff.py"
-PICKER = HERE / "handoff-pick.py"
+LUA = HERE / "handoff-buffer.lua"
+NVIM = shutil.which("nvim") or "/opt/nvim-linux64/bin/nvim"
 PRESETS = HERE.parent / "handoff-presets.md"
 _loader = SourceFileLoader("handoff", str(HANDOFF))
 handoff = importlib.util.module_from_spec(importlib.util.spec_from_loader("handoff", _loader))
@@ -104,9 +105,18 @@ class Server:
         raise AssertionError("the stub claude never ran in the new window")
 
 
-def pick(buf, *args):
-    return subprocess.run([sys.executable, str(PICKER), str(buf), *args], cwd=buf.parent,
-                          capture_output=True, text=True, timeout=10)
+def press(buf, project="/home/lucas/pin"):
+    """The default buffer and the values.json beside it that handoff-buffer.lua reads, as a press writes them."""
+    p = handoff.press(str(project), ["obsidian", "perf"], {**VALUES, "preset": list(handoff.presets([]))})
+    buf.write_text(handoff.render(p, []))
+    buf.with_name(buf.name.replace(".launch.md", ".launch.values.json")).write_text(json.dumps(p))
+
+
+def choose(buf, preset):
+    """Open buf in nvim the way prefix+T does (handoff-buffer.lua, without Lucas's config), set preset:, then
+    :wq, and :cq if the write was refused. Exit 0 launches, non-zero aborts."""
+    return subprocess.run([NVIM, "--headless", "--clean", f"+luafile {LUA}", "-c", f"%s/^preset:.*/preset: {preset}/",
+                           "-c", "wq", "-c", "cq", str(buf)], capture_output=True, text=True, timeout=20)
 
 
 class LaunchToday(unittest.TestCase):
@@ -142,47 +152,46 @@ class PresetsFile(unittest.TestCase):
         for name, section in presets().items():
             with self.subTest(preset=name):
                 fields, _ = handoff.parse_buffer(section)
+                self.assertTrue(fields, "no fields read: the ━ bar above them is missing")
                 self.assertLessEqual(set(fields), set(defaults), "a field the launch buffer does not have")
                 self.assertEqual(handoff.problems({**defaults, **fields}, live_values()), [])
 
 
-class Picker(unittest.TestCase):
-    """The picker's contract. `handoff-pick.py <buffer> --choose <preset>` applies a preset without showing
-    anything, so these run with no terminal; the screen itself is checked by hand. Exit 0 launches,
-    non-zero aborts, as with nvim's :wq and :cq."""
+class Preset(unittest.TestCase):
+    """The preset: field, as nvim with handoff-buffer.lua fills it in. Retargeted from the Picker class,
+    which pinned a handoff-pick.py --choose that buffer v2 dropped; same four checks, auto in place of
+    defaults. The screen itself is checked by hand."""
 
     def setUp(self):
-        if not PICKER.exists():
-            self.fail(f"{PICKER.name} does not exist yet; this is its pin")
-        self.tmp = Path(tempfile.mkdtemp(prefix="handoff-pick-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="handoff-preset-"))
         self.buf = self.tmp / "pin.launch.md"
-        self.buf.write_text(default_buffer())
+        press(self.buf)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_defaults_leaves_the_buffer_alone(self):
+    def test_auto_leaves_the_buffer_alone(self):
         before = self.buf.read_text()
-        self.assertEqual(pick(self.buf, "--choose", "defaults").returncode, 0)
+        self.assertEqual(choose(self.buf, "auto").returncode, 0)
         self.assertEqual(self.buf.read_text(), before)
 
     def test_unknown_preset_aborts_and_changes_nothing(self):
         before = self.buf.read_text()
-        self.assertNotEqual(pick(self.buf, "--choose", "no-such-preset").returncode, 0)
+        self.assertNotEqual(choose(self.buf, "no-such-preset").returncode, 0)
         self.assertEqual(self.buf.read_text(), before)
 
     def test_each_preset_changes_only_what_it_sets(self):
         defaults, _ = handoff.parse_buffer(default_buffer())
         for name, section in presets().items():
             with self.subTest(preset=name):
-                self.buf.write_text(default_buffer())
-                run = pick(self.buf, "--choose", name)
+                press(self.buf)
+                run = choose(self.buf, name)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 want, want_note = handoff.parse_buffer(section)
                 got, got_note = handoff.parse_buffer(self.buf.read_text())
                 self.assertEqual(handoff.problems(got, live_values()), [])
                 for key, default in defaults.items():
-                    self.assertEqual(got.get(key), want.get(key, default), key)
+                    self.assertEqual(got.get(key), {**want, "preset": name}.get(key, default), key)
                 self.assertEqual(got_note, want_note)
 
     def test_red_team_reaches_claude(self):
@@ -190,12 +199,35 @@ class Picker(unittest.TestCase):
             project = s.dir / "pin"
             project.mkdir()
             buf = s.buffer(default_buffer(str(project)), project)
-            run = pick(buf, "--choose", "red-team")
+            press(buf, project)
+            run = choose(buf, "red-team")
             self.assertEqual(run.returncode, 0, run.stderr)
             argv = s.launch(buf)
         self.assertEqual(argv[:6], ["--model", "fable", "--effort", "xhigh", "-n", "redteam"])
         self.assertTrue(argv[-1].startswith("Red-team the previous session"), argv[-1][:80])
         self.assertNotIn("Load these skills", argv[-1])
+
+
+class Buffer(unittest.TestCase):
+    """What launch reads from buffer v2: the prompt above the first bar, the fields between the bars."""
+
+    def test_comment_lines_and_bars_never_reach_the_prompt(self):
+        fields, prompt = handoff.parse_buffer(f"do this\n# not this\nthen that\n{handoff.BAR}\nmodel: opus\n"
+                                              f"{handoff.BAR}\ndetected skills: perf\n# the end\n")
+        self.assertEqual(prompt, "do this\nthen that")
+        self.assertEqual(fields, {"model": "opus"})
+
+    def test_a_slash_name_loads_its_skill_and_the_written_line_is_not_read(self):
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            buf = s.buffer("", project)
+            press(buf, project)
+            text = buf.read_text().replace("detected skills: obsidian perf", "detected skills: debug", 1)
+            buf.write_text("take a /screenshot of /mnt/c/x" + text)
+            argv = s.launch(buf)
+        self.assertTrue(argv[-1].startswith("take a /screenshot of /mnt/c/x\n\nThe previous session's"), argv[-1])
+        self.assertTrue(argv[-1].endswith(" Load these skills: screenshot, obsidian, perf."), argv[-1])
 
 
 if __name__ == "__main__":

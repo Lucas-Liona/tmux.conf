@@ -1,0 +1,37 @@
+# prefix+T's launch buffer (scripts/handoff.py): which fields it shows and in what order, what
+# they start as, and the words in its # block. Presets are in handoff-presets.md. Read on every
+# press, so a change here shows on the next one.
+
+# Shown in this order between the two bars. A field left out is still in the file, hidden (nvim
+# does not draw it), and keeps its default or what the preset sets.
+show = ["model", "effort", "preset", "old"]
+
+[defaults]
+model = "opus"
+effort = "xhigh"
+preset = "auto"
+old = "keep"
+others = "name-only"
+name = "{dir}-2"  # {dir}: the name of the pane's directory
+# skills: the auto preset's, worked out on each press
+
+# One line per field in the # block. {values} is what the field accepts today.
+[help]
+model = "{values}, or a full claude-… id"
+effort = "{values}"
+preset = "what each one sets (auto: the two skills loaded most here, and the old session's):"
+old = "keep leaves the old session running; close ends it once it is idle"
+skills = "the preset's skills, added to the prompt's /names"
+others = "what every other skill in ~/.claude/skills becomes: {values}"
+name = "shown in the prompt box and /resume"
+
+# The top of the # block. {seen}: other skills loaded in this directory.
+[text]
+top = """
+Write the new session's first prompt above the first bar; /name anywhere in it
+loads that skill. Lines starting with # are dropped. An empty prompt starts the
+session with the transcript as context only.
+:wq launches, :cq aborts. Tab completes a field or a /name; gf opens a skill's SKILL.md.
+Also loaded in this directory: {seen}
+"""
+hidden = "Hidden, set by the preset or handoff.toml:"

@@ -10,9 +10,19 @@ pane's shell, whose ~/.claude/sessions/<pid>.json names the session id and cwd. 
 out in full to ~/.cache/handoff/, wrapped in <previous-session> so the new agent reads it as context, not
 as instructions. A pane with no Claude hands over its scrollback instead.
 
-Then a popup opens nvim on a launch buffer: model, effort, skills and a note for the new session, with
-completion and checks from handoff-buffer.lua. :wq launches claude in a new window with those settings and
-the note (empty is fine: context only) as its first prompt; :cq is the only way out without launching.
+Then a popup opens nvim on a launch buffer, laid out like git's commit buffer:
+
+    the new session's first prompt; /name anywhere in it loads that skill
+    ━━━━━━━━
+    model:  opus        every field, in handoff.toml's order; the ones it does not show are in the
+    preset: auto        file too, hidden by handoff-buffer.lua, so the file holds every value
+    ━━━━━━━━
+    detected skills: …  the prompt's /names and the preset's skills; drawn, never read
+    # lines starting with # are dropped: what each field accepts and means
+
+A preset (handoff-presets.md, laid out the same way) fills in the fields it sets; handoff-buffer.lua does
+that as you type, with completion and checks. :wq launches claude in a new window with those settings and
+the prompt (empty is fine: context only); :cq is the only way out without launching.
 """
 import importlib.util
 import json
@@ -24,6 +34,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 from collections import Counter
 from datetime import datetime
 from importlib.machinery import SourceFileLoader
@@ -32,6 +43,12 @@ from pathlib import Path
 HOME = Path.home()
 OUT = HOME / ".cache/handoff"
 SKILLS = HOME / ".claude/skills"
+CONFIG = Path(__file__).parent.parent / "handoff.toml"
+PRESETS = Path(__file__).parent.parent / "handoff-presets.md"
+BAR = "━" * 40  # handoff-buffer.lua draws it across the window; any line of ━ alone is a bar
+# A /name: after a space, a bracket or a quote, so "and/or" is not one. A known skill only, and not when
+# a / follows (/mnt/c is a path). handoff-buffer.lua matches the same way.
+SKILL_NAME = re.compile(r"(?<![^\s(\"'])/([A-Za-z0-9_][A-Za-z0-9_.:-]*)")
 # panel.is_injected drops every line starting with "<"; these are Lucas's own: a paste, and a `!` command.
 LUCAS_TAGS = ("<pasted_content", "<bash-input", "<bash-stdout")
 # skillOverrides' states have no code source to read; they are the table at
@@ -43,6 +60,9 @@ BUFFER_LUA = Path(__file__).with_name("handoff-buffer.lua")
 _loader = SourceFileLoader("panel", str(HOME / ".local/bin/panel.py"))
 panel = sys.modules["panel"] = importlib.util.module_from_spec(importlib.util.spec_from_loader("panel", _loader))
 _loader.exec_module(panel)  # registered first: its dataclasses look their module up in sys.modules
+_loader = SourceFileLoader("skill_badge", str(Path(__file__).with_name("skill-badge")))  # for description()
+badge = importlib.util.module_from_spec(importlib.util.spec_from_loader("skill_badge", _loader))
+_loader.exec_module(badge)
 
 
 def tmux(*args):
@@ -148,8 +168,36 @@ def personal_skills():
     return sorted(p.parent.name for p in SKILLS.glob("*/SKILL.md"))
 
 
+def skill_docs():
+    """{name: [description, SKILL.md]} for completion and gf: ~/.claude/skills, then each installed
+    plugin's skills under plugin:skill, the name a prompt loads them by."""
+    found = {p.parent.name: p for p in sorted(SKILLS.glob("*/SKILL.md"))}
+    try:
+        installed = json.loads((HOME / ".claude/plugins/installed_plugins.json").read_text())["plugins"]
+    except (OSError, ValueError, KeyError):
+        installed = {}
+    for key, installs in installed.items():
+        for install in installs:
+            for p in sorted(Path(install.get("installPath", "")).glob("skills/*/SKILL.md")):
+                found[f"{key.split('@')[0]}:{p.parent.name}"] = p
+    return {name: [badge.description(p), str(p)] for name, p in found.items()}
+
+
+def presets(auto):
+    """{name: (fields, prompt)}: auto (the press's usual skills) and none, then handoff-presets.md's,
+    each laid out like a launch buffer."""
+    found = {"auto": ({"skills": " ".join(auto)}, ""), "none": ({"skills": ""}, "")}
+    try:
+        text = PRESETS.read_text()
+    except OSError:
+        return found
+    for m in re.finditer(r"^## ([^\n]+)\n(.*?)(?=^## |\Z)", text, re.M | re.S):
+        found[m[1].strip()] = parse_buffer(m[2])
+    return found
+
+
 def allowed_values():
-    """What each header line accepts, read fresh on every press: effort levels and model aliases from
+    """What each field accepts, read fresh on every press: effort levels and model aliases from
     `claude --help` and the models skill, skills from ~/.claude/skills. An empty list means "could not
     read it", and that line is then not checked."""
     try:
@@ -170,13 +218,14 @@ def allowed_values():
         "skills": personal_skills(),
         "others": OVERRIDE_STATES,
         "old": ["keep", "close"],
+        "preset": list(presets([])),
     }
 
 
 def problems(fields, values):
-    """Header values that would make a bad launch; the Lua side checks the same rules as you type."""
+    """Field values that would make a bad launch; the Lua side checks the same rules as you type."""
     bad = []
-    for key in ("model", "effort", "others", "old"):
+    for key in ("model", "effort", "preset", "others", "old"):
         value, allowed = fields.get(key, ""), values.get(key) or []
         full_model_id = key == "model" and value.startswith("claude-")
         if allowed and value not in allowed and not full_model_id:
@@ -184,25 +233,64 @@ def problems(fields, values):
     return bad
 
 
-def launch_buffer(cwd, chosen, seen, values):
-    def row(key, value, comment):
-        return f"{key + ':':<8}{value:<23} # {comment}"
+def press(cwd, chosen, values):
+    """What one press builds the buffer from, written beside it for handoff-buffer.lua: the allowed
+    values, handoff.toml's fields and defaults, the presets, and each skill's description and path."""
+    cfg = tomllib.loads(CONFIG.read_text())
+    defaults = {key: value.replace("{dir}", Path(cwd).name) for key, value in cfg["defaults"].items()}
+    defaults["skills"] = " ".join(chosen)  # the auto preset's
+    return {**values, "config": cfg, "defaults": defaults, "order": list(dict.fromkeys([*cfg["show"], *defaults])),
+            "presets": {name: {"fields": f, "prompt": p} for name, (f, p) in presets(chosen).items()},
+            "skill_docs": skill_docs()}
 
-    def default(key, preferred):
-        options = values[key]
-        return preferred if preferred in options or not options else options[0]
-    short_models = [m for m in values["model"] if not m.startswith("claude-")]
+
+def row(key, value):
+    return f"{key + ':':<8}{value}".rstrip()  # handoff-buffer.lua writes fields the same way
+
+
+def detected_line(skills):
+    return "detected skills: " + (" ".join(skills) or "(none)")
+
+
+def comment_block(p, seen):
+    """The # lines under the second bar: handoff.toml's words, then each field with its values."""
+    cfg, show = p["config"], p["config"]["show"]
+    short_models = [m for m in p["model"] if not m.startswith("claude-")]
+    accepts = {"model": " ".join(short_models) or "could not read claude --help"}
+    lines = cfg["text"]["top"].strip("\n").replace("{seen}", " ".join(seen) or "none").split("\n") + [""]
+    for key in show:
+        lines.append(f"{key:<8} " + cfg["help"].get(key, "").replace(
+            "{values}", accepts.get(key) or " ".join(p.get(key) or []) or "could not read claude --help"))
+        if key == "preset":
+            width = max(map(len, p["presets"]))
+            for name, preset in p["presets"].items():
+                sets = [f"{k} {v or '(none)'}" for k, v in preset["fields"].items()]
+                sets += ["a first prompt"] if preset["prompt"] else []
+                lines.append(f"{'':<11}{name:<{width}}  {' · '.join(sets)}")
+    hidden = [key for key in p["order"] if key not in show]
+    if hidden:
+        lines += ["", cfg["text"]["hidden"]]
+        lines += [f"{key:<8} {p['defaults'].get(key) or '(none)'} · " + cfg["help"].get(key, "").replace(
+            "{values}", " ".join(p.get(key) or [])) for key in hidden]
+    return ["# " + line if line else "#" for line in lines]
+
+
+def render(p, seen):
+    """The buffer as it opens: an empty prompt, a bar, every field (the hidden ones too), a bar, the
+    detected skills and the # block. Opening it in nvim and writing it changes nothing."""
+    d = p["defaults"]
     return "\n".join([
-        row("model", default("model", "opus"), " ".join(short_models) or "could not read claude --help"),
-        row("effort", default("effort", "xhigh"), " ".join(values["effort"]) or "could not read claude --help"),
-        row("skills", ", ".join(chosen), "seen here: " + (", ".join(seen) or "none")),
-        row("others", default("others", "name-only"), " ".join(values["others"])),
-        row("old", "keep", " ".join(values["old"])),
-        row("name", f"{Path(cwd).name}-2", "shown in the prompt box and /resume"),
-        "---",
         "",
-        "",
-    ])
+        BAR,
+        *(row(key, d.get(key, "")) for key in p["order"]),
+        BAR,
+        detected_line(detected("", d.get("skills", ""), set(p["skill_docs"]))),
+        *comment_block(p, seen),
+    ]) + "\n"
+
+
+def launch_buffer(cwd, chosen, seen, values):
+    return render(press(cwd, chosen, values), seen)
 
 
 def main(pane_id, pane_pid, pane_path, session_id, client):
@@ -226,16 +314,17 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
         tmux("display-message", "-c", client, "-d", "8000",
              f"handoff: session cwd {cwd} differs from pane {pane_path}; using the pane's")
 
-    values = allowed_values()
+    chosen, seen = skill_defaults(pane_path, transcript)
+    p = press(pane_path, chosen, allowed_values())
     buffer = stem.with_suffix(".launch.md")
-    buffer.write_text(launch_buffer(pane_path, *skill_defaults(pane_path, transcript), values))
-    stem.with_suffix(".launch.values.json").write_text(json.dumps(values))  # read by handoff-buffer.lua
+    buffer.write_text(render(p, seen))
+    stem.with_suffix(".launch.values.json").write_text(json.dumps(p))  # read by handoff-buffer.lua
     stem.with_suffix(".launch.json").write_text(json.dumps({
         "dir": pane_path, "session": session_id, "client": client, "transcript": str(exported),
         "old_pid": info.get("pid") if transcript else None}))
     # nvim lives in /opt, which only the interactive shell puts on PATH; the popup runs with the server's.
     nvim = shutil.which("nvim") or "/opt/nvim-linux64/bin/nvim"
-    edit = [nvim, "+$", f"+luafile {BUFFER_LUA}", "+startinsert", str(buffer)]
+    edit = [nvim, f"+luafile {BUFFER_LUA}", "+startinsert", str(buffer)]
     aborted = ["tmux", "display-message", "-c", client, "-d", "8000", "handoff: :cq, nothing launched"]
     run = (f"if {shlex.join(edit)}; then {shlex.join([sys.executable, __file__, '--launch', str(buffer)])}; "
            f"else {shlex.join(aborted)}; fi")
@@ -245,13 +334,24 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
 
 
 def parse_buffer(text):
-    head, _, note = text.partition("\n---\n")
+    """(fields, prompt). Lines starting with # are dropped first, as in git's commit buffer. The prompt is
+    the text above the first bar; the fields are the `key: value` lines from there to the second bar.
+    Nothing after it is read: launch() works the detected skills out again from the prompt and skills:."""
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    bars = [i for i, line in enumerate(lines) if line and set(line) == {"━"}] + [len(lines)] * 2
     fields = {}
-    for line in head.splitlines():
+    for line in lines[bars[0] + 1:bars[1]]:
         key, sep, value = line.partition(":")
-        if sep:
-            fields[key.strip()] = value.split("#", 1)[0].strip()
-    return fields, note.strip()
+        if sep and key.strip():
+            fields[key.strip()] = value.strip()
+    return fields, "\n".join(lines[:bars[0]]).strip()
+
+
+def detected(prompt, skills, known):
+    """The skills a launch loads: each /name in the prompt that is a known skill, then skills: (the
+    preset's). handoff-buffer.lua draws the same list as you type."""
+    named = [m[1].rstrip(".:-") for m in SKILL_NAME.finditer(prompt) if prompt[m.end():m.end() + 1] != "/"]
+    return list(dict.fromkeys([n for n in named if n in known] + [s for s in re.split(r"[,\s]+", skills) if s]))
 
 
 def claude_bin():
@@ -266,11 +366,14 @@ def launch(buffer):
     ctx = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.json")).read_text())
     fields, note = parse_buffer(buffer.read_text())
     values = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.values.json")).read_text())
-    bad = problems(fields, values)
-    if bad:  # the buffer refuses to write these; this catches :q on an unedited bad buffer
+    # the buffer refuses to write these; this catches :q on an unedited bad buffer
+    bad = ["no ━ bar under the prompt, so no fields"] if not fields else []
+    fields = {**values.get("defaults", {}), **fields}  # a field line deleted by hand keeps its default
+    bad = bad or problems(fields, values)
+    if bad:
         return tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched; {'; '.join(bad)}")
 
-    chosen = [s for s in re.split(r"[,\s]+", fields.get("skills", "")) if s]
+    chosen = detected(note, fields.get("skills", ""), {*values.get("skills", []), *values.get("skill_docs", {})})
     overrides = {} if fields["others"] == "on" else {
         s: fields["others"] for s in personal_skills() if s not in chosen}
     # An empty note is fine: the new session gets the transcript as context and waits.

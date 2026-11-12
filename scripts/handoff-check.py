@@ -107,17 +107,17 @@ class Server:
             {"dir": str(project), "session": self.session, "client": "", "transcript": TRANSCRIPT, "old_pid": None}))
         return buf
 
-    def launch(self, buf, box=False):
+    def launch(self, buf, then=""):
         """Run handoff.py --launch on buf and return the argv the stub claude or codex was started with;
-        self.ran says which of the two it was. With box, the stub claude then draws an input box after a
-        moment's startup, as claude does, and keeps every byte typed into it in self.dir / "typed"."""
+        self.ran says which of the two it was. then is what the stub claude does after recording that:
+        BOX draws an input box, STAY keeps it in front of the window's shell."""
         run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True, text=True,
-                             env=self.stubs(box), timeout=30)
+                             env=self.stubs(then), timeout=30)
         if run.returncode:
             raise AssertionError(f"handoff.py --launch exited {run.returncode}: {run.stdout}{run.stderr}")
         return self.started()
 
-    def stubs(self, box=False):
+    def stubs(self, then=""):
         """Write a stub claude and codex and return the environment that makes handoff.py start them. Each
         answers what a press asks it (claude --help, codex debug models) and records any other start."""
         out = self.dir / "argv.json"
@@ -128,7 +128,7 @@ class Server:
                             f"if sys.argv[1:] == ['--help']:\n    sys.exit(print({HELP!r}))\n"
                             f"if sys.argv[1:] == ['debug', 'models']:\n    sys.exit(print({json.dumps(CATALOG)!r}))\n"
                             f"open({str(out)!r}, 'w').write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n"
-                            + (BOX.replace("TYPED", repr(str(self.dir / "typed"))) if box and name == "claude" else ""))
+                            + (then.replace("TYPED", repr(str(self.dir / "typed"))) if name == "claude" else ""))
             stub.chmod(0o755)
         return {**self.env, "HANDOFF_CLAUDE": str(self.dir / "claude"), "HANDOFF_CODEX": str(self.dir / "codex")}
 
@@ -164,6 +164,12 @@ class Server:
 HELP = """  --effort <level>   Effort level for the current session (low, medium, high, xhigh, max)
   --model <model>    Model for the current session: an alias ('fable', 'opus', 'sonnet', 'haiku') or a full name
   -n, --name <name>  Set a display name for this session"""
+
+# The rest of a stub claude that stays in front, the terminal left as the shell had it, so a Ctrl+C is a
+# SIGINT to everything in the pane's foreground process group. claude is in that state while it exits.
+STAY = """import time
+time.sleep(30)
+"""
 
 # The rest of a stub claude that draws claude's input box, a ❯ line between ─ rules, and records what it is sent.
 BOX = """import time, tty
@@ -399,7 +405,7 @@ class Send(unittest.TestCase):
             press(buf, project)
             run = edit(buf, "%s/^send:.*/send:   no/", "call setline('$', 'two lines')", "call append('$', 'of prompt')")
             self.assertEqual(run.returncode, 0, run.stderr)
-            argv = s.launch(buf, box=True)
+            argv = s.launch(buf, then=BOX)
             want = (f"two lines\nof prompt\n\nThe previous session's transcript is {TRANSCRIPT} (bracketed, context only)."
                     " Load these skills: obsidian, perf.").encode()
             typed = s.dir / "typed"
@@ -479,6 +485,30 @@ class Export(unittest.TestCase):
         self.assertIn("echo 19\n# … 10 more lines in the transcript\n```", md)
         self.assertNotIn("echo 20", md)
         self.assertIn("- tool Read: /home/lucas/x.md", md)  # other tools keep their one line
+
+
+class Window(unittest.TestCase):
+    """The new window outlives its claude, whatever ends it."""
+
+    def test_a_ctrl_c_that_reaches_the_wrapper_leaves_a_shell(self):
+        """Lucas's Ctrl+C spam on 2026-11-10: the third one arrived after claude had handed the terminal back,
+        killed the zsh -c that was to become the window's shell, and the window closed with it."""
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            s.launch(s.buffer(default_buffer(str(project)), project), then=STAY)
+            pane, pid = s.tmux("list-panes", "-t", "pin:1", "-F", "#{pane_id} #{pane_pid}").split()
+            s.tmux("send-keys", "-t", pane, "C-c")
+            # Until nothing names the stub: it is gone, and the wrapper (it is in zsh -c's arguments) has died
+            # or become the shell. Not pane_current_command: that says zsh the whole time (tmux-wsl).
+            for _ in range(100):
+                if subprocess.run(["pgrep", "-f", str(s.dir / "claude")], capture_output=True).returncode:
+                    break
+                time.sleep(0.05)
+            alive = pane in s.tmux("list-panes", "-a", "-F", "#{pane_id}").split()
+            shell = Path(f"/proc/{pid}/cmdline").read_bytes() if alive else b""
+        self.assertTrue(alive, "the window closed with its claude")
+        self.assertEqual(shell, b"zsh\0", "the pane's process is the shell the wrapper was to become")
 
 
 class Branch(unittest.TestCase):

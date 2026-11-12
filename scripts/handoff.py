@@ -66,6 +66,11 @@ BASH_LINES = 20  # of a command, in the export; a heredoc that writes a file can
 OVERRIDE_STATES = ["name-only", "on", "user-invocable-only", "off"]
 MODELS_SKILL = SKILLS / "models/SKILL.md"
 BUFFER_LUA = Path(__file__).with_name("handoff-buffer.lua")
+# What the new window runs: claude or codex, then a shell in its place. The trap is for a Ctrl+C that
+# arrives once claude has handed the terminal back but before it has exited: that one is a SIGINT to this
+# zsh too, and without the trap it dies and the window closes (2026-11-10). A no-op trap, not '': an
+# ignored signal would be inherited by claude, a trapped one is reset when it starts.
+WRAPPER = 'trap : INT; "$0" "$@"; exec zsh'
 # Set in a branch's window (launch()), so branch() can refuse there: a branch does not branch again.
 BRANCH_ENV = "HANDOFF_BRANCH"
 # panel.py already knows which "user" lines are Lucas and which are injected reminders; reuse that, unedited.
@@ -580,7 +585,7 @@ def launch(buffer):
     quiet = ["-d", "-e", f"{BRANCH_ENV}={branched.get('name') or branched['pane']}"] if branched else []
     made = subprocess.run(["tmux", "new-window", *quiet, "-P", "-F", "#{pane_id} #{session_name}:#{window_index}",
                            "-t", ctx["session"], "-c", ctx["dir"],
-                           "-e", f"PATH={bin_on_path(argv[0])['PATH']}", "zsh", "-c", '"$0" "$@"; exec zsh', *argv],
+                           "-e", f"PATH={bin_on_path(argv[0])['PATH']}", "zsh", "-c", WRAPPER, *argv],
                           capture_output=True, text=True)
     if made.returncode:  # printed too: the popup (-EE) stays open on a non-zero exit
         why = made.stderr.strip() or f"tmux new-window exited {made.returncode}"

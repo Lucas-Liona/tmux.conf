@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pins for prefix+T: the launch step, the presets file, and the launch buffer's preset: field.
+"""Pins for prefix+T: the launch step, the presets file, the launch buffer's preset: field, and --branch.
 
     python3 ~/.config/tmux/scripts/handoff-check.py
 
@@ -81,8 +81,11 @@ class Server:
     def __enter__(self):
         self.dir = Path(tempfile.mkdtemp(prefix="handoff-check-"))
         self.sock = str(self.dir / "tmux.sock")
-        subprocess.run(["tmux", "-S", self.sock, "-f", "/dev/null", "new-session", "-d", "-s", "pin"], check=True)
+        # -c: its pane sits in a directory no Claude ever ran in, so a branch from it finds no usual skills
+        subprocess.run(["tmux", "-S", self.sock, "-f", "/dev/null", "new-session", "-d", "-s", "pin", "-c", str(self.dir)],
+                       check=True)
         self.env = {**os.environ, "TMUX": f"{self.sock},0,0", "PYTHONDONTWRITEBYTECODE": "1"}
+        self.env.pop("HANDOFF_BRANCH", None)  # these pins also run from inside a branch
         reached = subprocess.run(["tmux", "list-sessions", "-F", "#{socket_path} #{session_id}"], env=self.env,
                                  capture_output=True, text=True).stdout.split()
         if reached[:1] != [self.sock]:
@@ -108,18 +111,30 @@ class Server:
         """Run handoff.py --launch on buf and return the argv the stub claude or codex was started with;
         self.ran says which of the two it was. With box, the stub claude then draws an input box after a
         moment's startup, as claude does, and keeps every byte typed into it in self.dir / "typed"."""
+        run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True, text=True,
+                             env=self.stubs(box), timeout=30)
+        if run.returncode:
+            raise AssertionError(f"handoff.py --launch exited {run.returncode}: {run.stdout}{run.stderr}")
+        return self.started()
+
+    def stubs(self, box=False):
+        """Write a stub claude and codex and return the environment that makes handoff.py start them. Each
+        answers what a press asks it (claude --help, codex debug models) and records any other start."""
         out = self.dir / "argv.json"
+        out.unlink(missing_ok=True)
         for name in ("claude", "codex"):
             stub = self.dir / name
             stub.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                            f"if sys.argv[1:] == ['--help']:\n    sys.exit(print({HELP!r}))\n"
+                            f"if sys.argv[1:] == ['debug', 'models']:\n    sys.exit(print({json.dumps(CATALOG)!r}))\n"
                             f"open({str(out)!r}, 'w').write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n"
                             + (BOX.replace("TYPED", repr(str(self.dir / "typed"))) if box and name == "claude" else ""))
             stub.chmod(0o755)
-        run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True, text=True,
-                             env={**self.env, "HANDOFF_CLAUDE": str(self.dir / "claude"),
-                                  "HANDOFF_CODEX": str(self.dir / "codex")}, timeout=30)
-        if run.returncode:
-            raise AssertionError(f"handoff.py --launch exited {run.returncode}: {run.stdout}{run.stderr}")
+        return {**self.env, "HANDOFF_CLAUDE": str(self.dir / "claude"), "HANDOFF_CODEX": str(self.dir / "codex")}
+
+    def started(self):
+        """The argv the stub in the new window was started with; self.ran says whether it was claude or codex."""
+        out = self.dir / "argv.json"
         for _ in range(100):
             if out.exists() and out.stat().st_size:
                 self.ran, *argv = json.loads(out.read_text())
@@ -127,6 +142,28 @@ class Server:
             time.sleep(0.1)
         raise AssertionError("the stub claude never ran in the new window")
 
+    def branch(self, text, **env):
+        """Run handoff.py --branch on a file holding text, as an agent in the server's first pane would.
+        Its files go to self.dir / "out", not ~/.cache/handoff. Returns the finished process."""
+        asked = self.dir / "asked.md"
+        asked.write_text(text)
+        pane = self.tmux("list-panes", "-t", "pin:0", "-F", "#{pane_id}")
+        return subprocess.run([sys.executable, str(HANDOFF), "--branch", str(asked)], capture_output=True, text=True,
+                              env={**self.stubs(), "TMUX_PANE": pane, "HANDOFF_OUT": str(self.dir / "out"), **env},
+                              timeout=30)
+
+    def tmux(self, *args):
+        return subprocess.run(["tmux", "-S", self.sock, *args], capture_output=True, text=True).stdout.strip()
+
+    def windows(self):
+        """["<window id> <1 if it is the one in view>", ...] of the pin session."""
+        return self.tmux("list-windows", "-t", "pin", "-F", "#{window_id} #{window_active}").splitlines()
+
+
+# The two parts of `claude --help` a press reads: the efforts, and the model aliases.
+HELP = """  --effort <level>   Effort level for the current session (low, medium, high, xhigh, max)
+  --model <model>    Model for the current session: an alias ('fable', 'opus', 'sonnet', 'haiku') or a full name
+  -n, --name <name>  Set a display name for this session"""
 
 # The rest of a stub claude that draws claude's input box, a ❯ line between ─ rules, and records what it is sent.
 BOX = """import time, tty
@@ -442,6 +479,80 @@ class Export(unittest.TestCase):
         self.assertIn("echo 19\n# … 10 more lines in the transcript\n```", md)
         self.assertNotIn("echo 20", md)
         self.assertIn("- tool Read: /home/lucas/x.md", md)  # other tools keep their one line
+
+
+class Branch(unittest.TestCase):
+    """handoff.py --branch: an agent hands over its own pane, with a file where the popup would be."""
+
+    ASKED = "---\nmodel: sonnet\neffort: low\nname: progress\n---\n\nbuild the progress view\n"
+
+    def test_a_file_opens_a_window_behind_the_one_in_view(self):
+        with Server() as s:
+            before = s.windows()
+            run = s.branch(self.ASKED)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            argv, after = s.started(), s.windows()
+            out = s.dir / "out"
+            stem = next(out.glob("*.launch.md")).name.removesuffix(".launch.md")
+            left = sorted(f.name.removeprefix(stem) for f in out.iterdir())
+            fields, prompt = handoff.parse_buffer((out / f"{stem}.launch.md").read_text())
+            new_pane = run.stdout.split("in pane ")[1].split()[0]
+            shell = dict(line.split() for line in s.tmux("list-panes", "-a", "-F", "#{pane_id} #{pane_pid}").splitlines())
+            environ = Path(f"/proc/{shell[new_pane]}/environ").read_bytes().split(b"\0")
+        self.assertEqual(len(after), len(before) + 1)
+        self.assertEqual(after[0], before[0], "the window in view is still the one in view")
+        self.assertEqual(argv[:6], ["--model", "sonnet", "--effort", "low", "-n", "progress"])
+        self.assertEqual(argv[-1], f"build the progress view\n\nThe previous session's transcript is {out}/{stem}.md"
+                                   " (bracketed, context only). You are a branch of pane %0, which is still working on"
+                                   " its own task: do only what is asked here. When you finish, write the result to"
+                                   f" {out}/{stem}.result.md.")
+        self.assertEqual(left, [".launch.json", ".launch.md", ".launch.values.json", ".md"])  # what a press leaves
+        self.assertEqual((fields["model"], fields["old"], prompt), ("sonnet", "keep", "build the progress view"))
+        self.assertIn(f"result, when the branch is done: {out}/{stem}.result.md", run.stdout)
+        self.assertIn(b"HANDOFF_BRANCH=%0", environ, "the new window knows it is a branch")
+
+    def test_a_branch_does_not_branch(self):
+        with Server() as s:
+            before = s.windows()
+            run = s.branch(self.ASKED, HANDOFF_BRANCH="control-b5")
+            self.assertEqual(s.windows(), before)
+            self.assertFalse((s.dir / "out").exists(), "nothing exported either")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("itself a branch of control-b5", run.stderr)
+
+    def test_a_preset_and_a_codex_model_make_a_red_teamer_from_another_provider(self):
+        with Server() as s:
+            run = s.branch('---\npreset: red-team\nmodel: astra\neffort: high\nsend: "yes"\n---\n\nstart with the restore numbers\n')
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            argv = s.started()
+        self.assertEqual(s.ran, "codex")
+        self.assertEqual(argv[:4], ["-m", "gpt-6-astra", "-c", 'model_reasoning_effort="high"'])
+        self.assertTrue(argv[-1].startswith("Red-team the previous session"), argv[-1][:80])  # the preset's prompt first
+        self.assertIn("and stop.\n\nstart with the restore numbers\n\nThe previous session's transcript is", argv[-1])
+        self.assertNotIn("Load these skills", argv[-1])  # red-team sets skills: ""
+
+    def test_what_cannot_launch_is_refused_with_the_reason(self):
+        for asked, why in [("---\ndir: /tmp\n---\n\nx\n", "no field named dir"),
+                           ("---\nold: close\n---\n\nx\n", "old: close would end the session that is asking"),
+                           ("---\neffort: enormous\n---\n\nx\n", "effort: enormous is not one of low medium high xhigh max"),
+                           ("---\npreset: no-such\n---\n\nx\n", "preset: no-such is not one of")]:
+            with self.subTest(asked=asked), Server() as s:
+                before = s.windows()
+                run = s.branch(asked)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn(why, run.stdout + run.stderr)
+                self.assertEqual(s.windows(), before)
+
+    def test_two_branches_in_one_minute_keep_both_bookmarks(self):
+        with Server() as s:
+            for _ in range(2):
+                self.assertEqual(s.branch(self.ASKED).returncode, 0)
+            self.assertEqual(len(list((s.dir / "out").glob("*.launch.md"))), 2)
+
+    def test_a_named_parent_is_told_by_name(self):
+        note = handoff.branch_note({"pane": "%522", "name": "control-b5", "result": "/x/r.md"})
+        self.assertIn("a branch of the session named control-b5 (pane %522)", note)
+        self.assertIn("write the result to /x/r.md and tell control-b5 with SendMessage", note)
 
 
 if __name__ == "__main__":

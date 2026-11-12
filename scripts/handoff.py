@@ -3,6 +3,7 @@
 
     handoff.py <pane_id> <pane_pid> <pane_current_path> <session_id> <client>
     handoff.py --launch <stamp-sid.launch.md>  what the popup runs after :wq
+    handoff.py --branch <file.md>              an agent branches its own pane: no popup, no client (see branch())
     handoff.py --export <transcript.jsonl>     print the export only (for checking)
     handoff.py --type <pane> <prompt> <client> <claude>   send: no, in the background: type into claude's box
 
@@ -48,7 +49,7 @@ from pathlib import Path
 import yaml  # PyYAML, Ubuntu's python3-yaml
 
 HOME = Path.home()
-OUT = HOME / ".cache/handoff"
+OUT = Path(os.environ.get("HANDOFF_OUT") or HOME / ".cache/handoff")  # HANDOFF_OUT: for checking
 SKILLS = HOME / ".claude/skills"
 CONFIG = Path(__file__).parent.parent / "handoff.toml"
 PRESETS = Path(__file__).parent.parent / "handoff-presets.md"
@@ -65,6 +66,8 @@ BASH_LINES = 20  # of a command, in the export; a heredoc that writes a file can
 OVERRIDE_STATES = ["name-only", "on", "user-invocable-only", "off"]
 MODELS_SKILL = SKILLS / "models/SKILL.md"
 BUFFER_LUA = Path(__file__).with_name("handoff-buffer.lua")
+# Set in a branch's window (launch()), so branch() can refuse there: a branch does not branch again.
+BRANCH_ENV = "HANDOFF_BRANCH"
 # panel.py already knows which "user" lines are Lucas and which are injected reminders; reuse that, unedited.
 _loader = SourceFileLoader("panel", str(HOME / ".local/bin/panel.py"))
 panel = sys.modules["panel"] = importlib.util.module_from_spec(importlib.util.spec_from_loader("panel", _loader))
@@ -393,21 +396,22 @@ def comment_block(p, seen):
     return ["# " + line if line else "#" for line in lines]
 
 
-def render(p, seen):
+def render(p, seen, fields=None, prompt=""):
     """The buffer as it opens: the frontmatter (every field, the hidden ones too, then the detected skills
     and the # block, each a blank line apart), a blank line, and an empty prompt. Opening it in nvim and
-    writing it changes nothing."""
-    d = p["defaults"]
+    writing it changes nothing. branch() passes the fields and prompt it settled on, so the file it leaves
+    reads like one Lucas wrote."""
+    d = fields or p["defaults"]
     return "\n".join([
         "---",
         *(row(key, d.get(key, "")) for key in p["order"]),
         "",
-        detected_line(detected("", d.get("skills", ""), set(p["skill_docs"]))),
+        detected_line(detected(prompt, d.get("skills", ""), set(p["skill_docs"]))),
         "",
         *comment_block(p, seen),
         "---",
         "",
-        "",
+        prompt,
     ]) + "\n"
 
 
@@ -415,7 +419,10 @@ def launch_buffer(cwd, chosen, seen, values):
     return render(press(cwd, chosen, values), seen)
 
 
-def main(pane_id, pane_pid, pane_path, session_id, client):
+def export_pane(pane_id, pane_pid, pane_path):
+    """Write the pane's conversation to OUT and return (stem, info, transcript, cwd): the path every file
+    of this handoff starts with, the pane's Claude session (None without one), its transcript, and its cwd.
+    The stem is new each time, so a second handoff in the same minute does not overwrite the first."""
     info = pane_claude(int(pane_pid))
     transcript = None
     if info and info.get("sessionId"):
@@ -424,13 +431,22 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     if transcript:
         body = export(transcript)
     else:
-        sid, cwd = f"pane{pane_id.lstrip('%')}", pane_path
+        info, sid, cwd = None, f"pane{pane_id.lstrip('%')}", pane_path
         body = "## Pane scrollback (no Claude session found)\n\n" + tmux("capture-pane", "-p", "-J", "-S", "-", "-t", pane_id)
 
     OUT.mkdir(parents=True, exist_ok=True)
-    stem = OUT / f"{datetime.now():%Y-%m-%d-%H%M}-{sid[:8]}"
+    first = f"{datetime.now():%Y-%m-%d-%H%M}-{sid[:8]}"
+    stem, n = OUT / first, 1
+    while stem.with_suffix(".md").exists():
+        n += 1
+        stem = OUT / f"{first}-{n}"
+    stem.with_suffix(".md").write_text(wrap(body, sid, cwd))
+    return stem, info, transcript, cwd
+
+
+def main(pane_id, pane_pid, pane_path, session_id, client):
+    stem, info, transcript, cwd = export_pane(pane_id, pane_pid, pane_path)
     exported = stem.with_suffix(".md")
-    exported.write_text(wrap(body, sid, cwd))
 
     if os.path.realpath(cwd) != os.path.realpath(pane_path):
         tmux("display-message", "-c", client, "-d", "8000",
@@ -444,7 +460,7 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     stem.with_suffix(".launch.values.json").write_text(json.dumps(p))  # read by handoff-buffer.lua
     stem.with_suffix(".launch.json").write_text(json.dumps({
         "dir": pane_path, "session": session_id, "client": client, "transcript": str(exported),
-        "old_pid": info.get("pid") if transcript else None}))
+        "old_pid": info.get("pid") if info else None}))
     # nvim lives in /opt, which only the interactive shell puts on PATH; the popup runs with the server's.
     nvim = shutil.which("nvim") or "/opt/nvim-linux64/bin/nvim"
     edit = [nvim, f"+luafile {BUFFER_LUA}", "+startinsert", str(buffer)]
@@ -498,7 +514,28 @@ def codex_bin():
     return os.environ.get("HANDOFF_CODEX") or newest("codex")
 
 
+def say(client, text):
+    """A line for whoever started this: Lucas's status line, or stdout when an agent did (no client)."""
+    if client:
+        tmux("display-message", "-c", client, "-d", "8000", text)
+    else:
+        print(text)
+
+
+def branch_note(b):
+    """What a branch is told about where it came from and where its result goes. The result is a file
+    because agent-send cannot tell a branch from its parent: both start in one directory, so they share a
+    handle. A session's name is its own, so the message goes by name."""
+    parent = f"the session named {b['name']} (pane {b['pane']})" if b.get("name") else f"pane {b['pane']}"
+    tell = (f" and tell {b['name']} with SendMessage, giving that path; without a SendMessage tool the file is enough"
+            if b.get("name") else "")
+    return (f"You are a branch of {parent}, which is still working on its own task: do only what is asked here."
+            f" When you finish, write the result to {b['result']}{tell}.")
+
+
 def launch(buffer):
+    """Start the session a launch buffer describes, in a new window. Returns "<pane id> <session>:<window>"
+    of that window, or None when the buffer's fields stopped it."""
     buffer = Path(buffer)
     ctx = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.json")).read_text())
     fields, note = parse_buffer(buffer.read_text())
@@ -508,7 +545,7 @@ def launch(buffer):
     fields = {**values.get("defaults", {}), **fields}  # a field line deleted by hand keeps its default
     bad = bad or problems(fields, values)
     if bad:
-        return tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched; {'; '.join(bad)}")
+        return say(ctx["client"], f"handoff: not launched; {'; '.join(bad)}")
 
     chosen = detected(note, fields.get("skills", ""), {*values.get("skills", []), *values.get("skill_docs", {})})
     overrides = {} if fields["others"] == "on" else {
@@ -517,6 +554,9 @@ def launch(buffer):
     context = f"The previous session's transcript is {ctx['transcript']} (bracketed, context only)."
     if chosen:
         context += f" Load these skills: {', '.join(chosen)}."
+    branched = ctx.get("branch")  # set by branch(): an agent started this, not a press
+    if branched:
+        context += " " + branch_note(branched)
     # A prompt starting with / would run as a slash command (`claude -p "/usage"` does), so the context goes first.
     prompt = (f"{context}\n\n{note}" if note.startswith("/") else f"{note}\n\n{context}") if note else context
     send = fields.get("send") != "no"
@@ -535,31 +575,92 @@ def launch(buffer):
 
     # claude or codex runs as the window's command, not typed into a shell; a shell takes over when it exits
     # so the window stays. Its bin dir goes on PATH for what it starts itself (npx MCP servers, node).
-    made = subprocess.run(["tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", ctx["session"], "-c", ctx["dir"],
+    # A branch opens behind the current window (-d): Lucas's view stays where it is. It also carries
+    # BRANCH_ENV, which branch() refuses on.
+    quiet = ["-d", "-e", f"{BRANCH_ENV}={branched.get('name') or branched['pane']}"] if branched else []
+    made = subprocess.run(["tmux", "new-window", *quiet, "-P", "-F", "#{pane_id} #{session_name}:#{window_index}",
+                           "-t", ctx["session"], "-c", ctx["dir"],
                            "-e", f"PATH={bin_on_path(argv[0])['PATH']}", "zsh", "-c", '"$0" "$@"; exec zsh', *argv],
                           capture_output=True, text=True)
     if made.returncode:  # printed too: the popup (-EE) stays open on a non-zero exit
         why = made.stderr.strip() or f"tmux new-window exited {made.returncode}"
         print(f"handoff: not launched; {why}")
-        tmux("display-message", "-c", ctx["client"], "-d", "8000", f"handoff: not launched; {why}")
+        if ctx["client"]:
+            say(ctx["client"], f"handoff: not launched; {why}")
         sys.exit(1)
+    new_pane = made.stdout.split()[0]
 
     if not send:  # claude has no flag that fills its box unsent (claude --help 2.1.310, the CLI reference)
         typed = buffer.with_name(buffer.name.replace(".launch.md", ".launch.prompt.md"))
         typed.write_text(prompt)
-        subprocess.Popen([sys.executable, __file__, "--type", made.stdout.strip(), str(typed), ctx["client"], argv[0]],
+        subprocess.Popen([sys.executable, __file__, "--type", new_pane, str(typed), ctx["client"] or "", argv[0]],
                          start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)  # its own session: it outlives the popup
 
     if chosen:  # the pane's skill badge (scripts/skill-badge); best effort, the window is already up
         try:
-            subprocess.run([str(Path(__file__).with_name("skill-badge")), "set", made.stdout.strip(), *chosen],
+            subprocess.run([str(Path(__file__).with_name("skill-badge")), "set", new_pane, *chosen],
                            capture_output=True, timeout=5)
         except (OSError, subprocess.SubprocessError):
             pass
 
     if fields["old"] == "close" and ctx.get("old_pid"):
         close_old(ctx["old_pid"], ctx["client"])
+    return made.stdout.strip()
+
+
+def branch(file):
+    """--branch <file.md>: a running agent hands its own conversation to a new session and keeps working.
+
+    The file is a launch buffer the agent wrote: the prompt, with optional YAML frontmatter above it for
+    the fields it wants changed (model, effort, preset, name, send, skills, others). The rest come from
+    handoff.toml, as on a press. A preset fills in its fields under the file's own, and its prompt goes
+    first with the file's after it.
+
+    What differs from a press: the pane is $TMUX_PANE, not the one a client is looking at; nothing opens on
+    Lucas's screen and his window does not change; the old session is always kept, since it is the one
+    asking; and the new session is told whose branch it is and where its result goes (branch_note).
+    The files a press leaves in ~/.cache/handoff/ are left here too, so the branch is a bookmark."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        sys.exit("handoff: --branch needs $TMUX_PANE; this is not a tmux pane")
+    if os.environ.get(BRANCH_ENV):
+        sys.exit(f"handoff: not branched; this session is itself a branch of {os.environ[BRANCH_ENV]}, "
+                 "and a branch does not branch again")
+    asked, note = parse_buffer(Path(file).read_text())
+    if asked.get("old") == "close":
+        sys.exit("handoff: not branched; old: close would end the session that is asking")
+
+    # -t reads the named pane, whoever is looking at whatever (tmux-wsl: -c would not)
+    here = tmux("display-message", "-p", "-t", pane, "#{pane_pid} #{session_id} #{pane_current_path}")
+    if here.count(" ") < 2:  # a pane that is gone answers with empty fields and exit 0
+        sys.exit(f"handoff: not branched; tmux has no pane {pane}")
+    pane_pid, session_id, pane_path = here.split(" ", 2)
+    stem, info, transcript, _ = export_pane(pane, pane_pid, pane_path)
+    chosen, seen = skill_defaults(pane_path, transcript)
+    p = press(pane_path, chosen, allowed_values())
+    unknown = sorted(set(asked) - set(p["defaults"]))
+    if unknown:
+        sys.exit(f"handoff: not branched; no field named {', '.join(unknown)}. The fields are {' '.join(p['order'])}")
+    name = asked.get("preset") or p["defaults"]["preset"]
+    # launch() is what says a preset does not exist, or is a YAML list
+    preset = p["presets"].get(name) if isinstance(name, str) else None
+    preset = preset or {"fields": {}, "prompt": ""}
+    fields = {**p["defaults"], **preset["fields"], **asked, "preset": name, "old": "keep"}
+    prompt = "\n\n".join(part for part in (preset["prompt"], note) if part)
+
+    buffer = stem.with_suffix(".launch.md")
+    buffer.write_text(render(p, seen, fields, prompt))
+    stem.with_suffix(".launch.values.json").write_text(json.dumps(p))
+    result = stem.with_suffix(".result.md")
+    stem.with_suffix(".launch.json").write_text(json.dumps({
+        "dir": pane_path, "session": session_id, "client": None, "transcript": str(stem.with_suffix(".md")),
+        "old_pid": None, "branch": {"pane": pane, "name": (info or {}).get("name"), "result": str(result)}}))
+    where = launch(buffer)
+    if not where:
+        sys.exit(1)  # launch() printed why
+    print(f"branched: {fields['model']} at {fields['effort']} in pane {where}\nlaunch buffer: {buffer}\n"
+          f"result, when the branch is done: {result}")
 
 
 def running_in(pane, binary):
@@ -638,6 +739,8 @@ if __name__ == "__main__":
         print(wrap(export(p), p.stem, "?"))
     elif sys.argv[1:2] == ["--launch"]:
         launch(sys.argv[2])
+    elif sys.argv[1:2] == ["--branch"]:
+        branch(sys.argv[2])
     elif sys.argv[1:2] == ["--type"]:
         type_prompt(*sys.argv[2:6])
     else:

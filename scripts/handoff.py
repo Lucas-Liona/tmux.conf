@@ -28,7 +28,7 @@ the way parse_buffer does.
 
 A preset (handoff-presets.md, laid out the same way) fills in the fields it sets; handoff-buffer.lua does
 that as you type, with completion and checks. :wq launches claude in a new window with those settings and
-the prompt (empty is fine: context only); :cq is the only way out without launching.
+the prompt (empty is fine: context only); :q, :q! and :cq leave without launching.
 """
 import importlib.util
 import json
@@ -465,7 +465,8 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     stem.with_suffix(".launch.values.json").write_text(json.dumps(p))  # read by handoff-buffer.lua
     stem.with_suffix(".launch.json").write_text(json.dumps({
         "dir": pane_path, "session": session_id, "client": client, "transcript": str(exported),
-        "old_pid": info.get("pid") if info else None}))
+        "old_pid": info.get("pid") if info else None,
+        "written_ns": buffer.stat().st_mtime_ns}))  # launch() reads it: only a buffer written since then launches
     # nvim lives in /opt, which only the interactive shell puts on PATH; the popup runs with the server's.
     nvim = shutil.which("nvim") or "/opt/nvim-linux64/bin/nvim"
     edit = [nvim, f"+luafile {BUFFER_LUA}", "+startinsert", str(buffer)]
@@ -479,7 +480,7 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
                                 .splitlines()) if c == client]
     height = str(min(text.count("\n") + 10, rows[0] - 2)) if rows else "90%"
     tmux("display-popup", "-c", client, "-w", "80%", "-h", height, "-d", pane_path,
-         "-T", " handoff: :wq launches, :cq aborts ", "-EE", run)
+         "-T", " handoff: :wq launches, :q aborts ", "-EE", run)
 
 
 def parse_buffer(text):
@@ -543,9 +544,13 @@ def launch(buffer):
     of that window, or None when the buffer's fields stopped it."""
     buffer = Path(buffer)
     ctx = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.json")).read_text())
+    # nvim exits 0 on :q and :q! as it does on :wq, so the exit code cannot tell them apart; nor can the
+    # text, since :wq on an untouched buffer is a launch (the transcript as context only). The write can.
+    if buffer.stat().st_mtime_ns == ctx.get("written_ns"):
+        return say(ctx["client"], "handoff: quit without :wq, nothing launched")
     fields, note = parse_buffer(buffer.read_text())
     values = json.loads(buffer.with_name(buffer.name.replace(".launch.md", ".launch.values.json")).read_text())
-    # the buffer refuses to write these; this catches :q on an unedited bad buffer
+    # the buffer refuses to write these; this catches a front end that does not check them
     bad = ["no YAML frontmatter (--- lines) above the prompt, so no fields"] if not fields else []
     fields = {**values.get("defaults", {}), **fields}  # a field line deleted by hand keeps its default
     bad = bad or problems(fields, values)

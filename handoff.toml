@@ -35,7 +35,7 @@ The new session's first prompt goes below the closing ---, as markdown: /name
 anywhere in it loads that skill, and # there starts a heading. Up here, # lines
 are YAML comments and are dropped. An empty prompt starts the session with the
 transcript as context only.
-:wq launches, :cq aborts. Tab completes a field or a /name; gf opens a skill's SKILL.md.
+:wq launches, :q aborts. Tab completes a field or a /name; gf opens a skill's SKILL.md.
 Also loaded in this directory: {seen}
 """
 hidden = "Hidden, set by the preset or handoff.toml:"

@@ -4,7 +4,8 @@
     python3 ~/.config/tmux/scripts/handoff-check.py
 
 The seam is the launch buffer (~/.cache/handoff/<stamp>.launch.md). Whatever edits it, nvim today or another
-front end later, rewrites it and exits 0 to launch or non-zero to abort; `handoff.py --launch` then reads it.
+front end later, writes it and exits 0 to launch; leaving it unwritten, or exiting non-zero, aborts.
+`handoff.py --launch` then reads it.
 Launches go to a throwaway tmux server and a stub claude, never the live server; nvim runs headless.
 """
 import importlib.util
@@ -151,6 +152,16 @@ class Server:
         return subprocess.run([sys.executable, str(HANDOFF), "--branch", str(asked)], capture_output=True, text=True,
                               env={**self.stubs(), "TMUX_PANE": pane, "HANDOFF_OUT": str(self.dir / "out"), **env},
                               timeout=30)
+
+    def pressed(self):
+        """What prefix+T runs, from the server's first pane, and the launch buffer it leaves in self.dir /
+        "out". No client is attached, so the popup does not open: the pin edits the buffer in its place."""
+        pane = self.tmux("list-panes", "-t", "pin:0", "-F", "#{pane_id} #{pane_pid} #{pane_current_path}").split(" ", 2)
+        run = subprocess.run([sys.executable, str(HANDOFF), *pane, self.session, ""], capture_output=True, text=True,
+                             env={**self.stubs(), "HANDOFF_OUT": str(self.dir / "out")}, timeout=30)
+        if run.returncode:
+            raise AssertionError(f"handoff.py (the press) exited {run.returncode}: {run.stdout}{run.stderr}")
+        return next((self.dir / "out").glob("*.launch.md"))
 
     def tmux(self, *args):
         return subprocess.run(["tmux", "-S", self.sock, *args], capture_output=True, text=True).stdout.strip()
@@ -485,6 +496,36 @@ class Export(unittest.TestCase):
         self.assertIn("echo 19\n# … 10 more lines in the transcript\n```", md)
         self.assertNotIn("echo 20", md)
         self.assertIn("- tool Read: /home/lucas/x.md", md)  # other tools keep their one line
+
+
+class Quit(unittest.TestCase):
+    """Only a written buffer launches. nvim exits 0 on :q and :q! as it does on :wq, so the exit code cannot say."""
+
+    def leave(self, buf, how):
+        return subprocess.run([NVIM, "--headless", "--clean", f"+luafile {LUA}", "-c", how, str(buf)],
+                              capture_output=True, text=True, timeout=20)
+
+    def test_q_bang_launches_nothing(self):
+        for how in ("q!", "q"):
+            with self.subTest(how=how), Server() as s:
+                buf, before = s.pressed(), s.windows()
+                self.assertEqual(self.leave(buf, how).returncode, 0)  # which is why the popup went on to --launch
+                run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True, text=True,
+                                     env=s.stubs(), timeout=30)
+                time.sleep(0.5)  # a window would be up by now
+                self.assertEqual(s.windows(), before)
+                self.assertFalse((s.dir / "argv.json").exists(), "claude was started")
+                self.assertIn("quit without :wq, nothing launched", run.stdout)
+
+    def test_wq_on_an_untouched_buffer_still_launches(self):
+        """An empty prompt is a launch too (the transcript as context only), so the content cannot say either."""
+        with Server() as s:
+            buf = s.pressed()
+            before = buf.read_text()
+            self.assertEqual(self.leave(buf, "wq").returncode, 0)
+            self.assertEqual(buf.read_text(), before)
+            argv = s.launch(buf)
+        self.assertIn("The previous session's transcript is", argv[-1])
 
 
 class Window(unittest.TestCase):

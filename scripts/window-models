@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""The model beside each Claude window's name on the status bar ("3 coord · opus").
+
+    window-models            set @claude_model on every window of the server, once; prints nothing
+    window-models --adopt    tmux.conf, at load: give the label to windows that carry their own format
+
+status-right runs this as a #() job, so tmux starts it about once per status-interval, for the
+whole server rather than once per window: starting Python costs more than everything it then does.
+The window names draw the option themselves (tmux.conf, @catppuccin_window_text).
+
+Which claude is in which window is read the way panel.py reads it. Each running claude keeps
+~/.claude/sessions/<its pid>.json with its session id and directory. /proc/<pid>/stat says which
+terminal that pid is on and whether it is in the terminal's foreground group, and tmux says which
+window owns the terminal. The model is then the last thing the session's transcript says about it,
+read from the end of the file: an assistant reply's model, or a /model answer after it, so a
+switch shows before the next reply. Nothing known (no claude, no reply yet) clears the option.
+Codex windows are left alone: their sessions are not in ~/.claude.
+
+--adopt is for workmux. It gives each agent window its own copy of the window format, with its
+status icon added, and never refreshes that copy; a window stamped before the label existed would
+never draw it. --adopt writes the label into such copies, after the name, and leaves the rest.
+"""
+import json
+import os
+import sys
+
+CLAUDE = os.environ.get("WINDOW_MODELS_CLAUDE") or os.path.expanduser("~/.claude")  # the override: for checking
+TAILS = (1 << 16, 1 << 20)  # bytes read from the transcript's end: a second, longer look if the first finds nothing
+ASSISTANT, MODEL = '"type":"assistant"', '"model":"claude-'
+NAME, LABEL = " #W", "#{?#{@claude_model}, · #{@claude_model},}"  # tmux.conf's @catppuccin_window_text is NAME + LABEL
+SWITCHED = ('"content":"<local-command-stdout>Set model to ', '"content":"<local-command-stdout>Kept model as ')
+
+
+def run(*argv: str) -> str:
+    """argv's output. Not subprocess: importing it takes longer than the rest of this script runs."""
+    read, write = os.pipe()
+    pid = os.posix_spawnp(argv[0], argv, os.environ, file_actions=[(os.POSIX_SPAWN_DUP2, write, 1),
+                                                                    (os.POSIX_SPAWN_CLOSE, read)])
+    os.close(write)
+    with os.fdopen(read, "rb") as out:
+        text = out.read().decode(errors="replace")
+    os.waitpid(pid, 0)
+    return text
+
+
+def short(model: str) -> str:
+    """claude-opus-5-5 -> opus, claude-3-5-sonnet-20241022 -> sonnet, "Fable 5.1" -> fable."""
+    words = [w for w in model.lower().replace("-", " ").replace("`", " ").split() if w.isalpha() and w != "claude"]
+    return words[0] if words else ""
+
+
+def front_terminal(pid: str) -> str:
+    """/dev/pts/N when pid is a claude in the foreground group of that terminal, else ""."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            words = f.read().split(b"\0")[:2]
+    except OSError:
+        return ""  # no such process: most session files outlive theirs
+    if b"claude" not in [os.path.basename(w) for w in words]:
+        return ""  # the pid went to some other program since
+    _, _, group, _, tty, front = stat[stat.rindex(")") + 2:].split()[:6]  # comm can hold spaces: count from its ")"
+    tty = int(tty)
+    if group != front or (tty >> 8) & 0xFFF not in range(136, 144):  # 136-143: the pts majors
+        return ""
+    return f"/dev/pts/{(tty & 0xFF) | ((tty >> 12) & 0xFFF00)}"
+
+
+def transcript(cwd: str, session: str) -> str:
+    """The session's .jsonl: under the directory's name as Claude Code writes it, else wherever it is."""
+    projects = os.path.join(CLAUDE, "projects")
+    named = "".join(c if c.isalnum() and c.isascii() else "-" for c in cwd)
+    path = os.path.join(projects, named, session + ".jsonl")
+    if os.path.exists(path):
+        return path
+    try:
+        found = [d for d in os.listdir(projects) if os.path.exists(os.path.join(projects, d, session + ".jsonl"))]
+    except OSError:
+        found = []
+    return os.path.join(projects, found[0], session + ".jsonl") if found else ""
+
+
+def last_model(path: str) -> str:
+    """The newest of: an assistant record's model, a /model answer. Raw lines, not parsed: a line can be megabytes."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ""
+    for tail in TAILS:
+        with open(path, "rb") as f:
+            f.seek(max(0, size - tail))
+            lines = f.read().decode(errors="replace").split("\n")
+        for line in reversed(lines):
+            for marker in SWITCHED:
+                at = line.find(marker)
+                if at != -1:
+                    return short(line[at + len(marker):at + len(marker) + 40].split("\\n")[0])
+            at = line.find(MODEL)
+            if at != -1 and ASSISTANT in line and '"isSidechain":true' not in line:
+                return short(line[at + len('"model":"'):].split('"', 1)[0])
+        if size <= tail:
+            break
+    return ""
+
+
+def main() -> int:
+    rows = [row.split("\t") for row in run(
+        "tmux", "list-panes", "-a", "-F", "#{pane_tty}\t#{window_id}\t#{pane_active}\t#{@claude_model}").splitlines()]
+    window_of = {tty: (window, active == "1") for tty, window, active, _ in rows}
+    shown = {window: model for _, window, _, model in rows}
+    found: dict[str, tuple[bool, str]] = {}
+    try:
+        files = os.listdir(os.path.join(CLAUDE, "sessions"))
+    except OSError:
+        files = []
+    for name in files:
+        pid = name[:-5]
+        tty = front_terminal(pid) if name.endswith(".json") and pid.isdigit() else ""
+        if tty not in window_of:
+            continue
+        try:
+            with open(os.path.join(CLAUDE, "sessions", name)) as f:
+                info = json.load(f)
+        except (OSError, ValueError):
+            continue
+        window, active = window_of[tty]
+        model = last_model(transcript(info.get("cwd") or "", info.get("sessionId") or ""))
+        if model and (window not in found or active > found[window][0]):  # two claudes in a window: the active pane's
+            found[window] = (active, model)
+    changes: list[str] = []
+    for window, model in shown.items():
+        want = found.get(window, (False, ""))[1]
+        if want != model:
+            changes += ["set-option", "-w", "-t", window, "@claude_model", want, ";"] if want else \
+                       ["set-option", "-wu", "-t", window, "@claude_model", ";"]
+    if changes:
+        run("tmux", *changes[:-1])
+    return 0
+
+
+def adopt() -> int:
+    for window in run("tmux", "list-windows", "-a", "-F", "#{window_id}").split():
+        for option in ("window-status-format", "window-status-current-format"):
+            own = run("tmux", "show-options", "-wqv", "-t", window, option).rstrip("\n")  # "" when it has no copy
+            if own.count(NAME) == 1 and LABEL not in own:
+                run("tmux", "set-option", "-w", "-t", window, option, own.replace(NAME, NAME + LABEL))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(adopt() if sys.argv[1:] == ["--adopt"] else main())
+    except Exception:  # a #() job's output is drawn on the bar: stay silent
+        sys.exit(0)

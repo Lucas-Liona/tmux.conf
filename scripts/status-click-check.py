@@ -35,7 +35,7 @@ _loader.exec_module(status_click)
 MENU = """\
 # a comment
 
-say hi      h  sh: print popup-says-$STATUS_PANE-in-$PWD; read -k 1
+say hi      h  sh: print popup-says-$STATUS_PANE-in-$PWD-menu-$STATUS_MENU; read -k 1
 rename      r  tmux: rename-window '#{session_name} clicked'
 no key  tmux: set -g @clicked "it's set"
 """
@@ -50,6 +50,10 @@ class Parse(unittest.TestCase):
     def test_a_line_that_does_not_parse_is_kept_as_bad(self):
         for bad in ("just words", "label  sh:", "label  key  sh: x", "label  k  zsh: x", "one space sh: x"):
             self.assertEqual(status_click.items(bad), [(1, bad, "", None, "")], bad)
+
+    def test_the_menu_file_is_the_one_beside_tmux_conf(self):
+        """Whichever checkout the script runs from, with no path written into it."""
+        self.assertEqual(status_click.MENU, DEFAULTS)
 
     def test_every_line_of_the_shipped_menu_parses(self):
         got = status_click.items(DEFAULTS.read_text())
@@ -169,7 +173,7 @@ class Click(unittest.TestCase):
         self.click("⌘ menu")
         self.wait_for("say hi")
         self.click("say hi")
-        self.wait_for(f"popup-says-{self.pane}-in-{self.work}", seconds=15)  # zsh -i takes a moment
+        self.wait_for(f"popup-says-{self.pane}-in-{self.work}-menu-{self.menu}", seconds=15)  # zsh -i takes a moment
         self.keys("x")  # read -k 1 returns, the code ends, the popup closes
         self.wait_for("popup-says", gone=True)
 

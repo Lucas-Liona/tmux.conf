@@ -6,7 +6,7 @@
     status-click --edit <client> <pane>     the file in an editor popup (a right click on the ⌘)
     status-click --bind                     tmux.conf, once: put --edit on the right click
 
-The file is ~/.config/tmux/click-menu.conf and is read on every click: no reload after an edit.
+The file is click-menu.conf beside tmux.conf and is read on every click: no reload after an edit.
 Its header says how a line is written. A line that does not parse is drawn greyed out with its
 line number, and the rest of the menu still works.
 
@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 
 ME = Path(__file__).resolve()
-MENU = Path(os.environ.get("STATUS_CLICK_MENU") or Path.home() / ".config/tmux/click-menu.conf")
+MENU = Path(os.environ.get("STATUS_CLICK_MENU") or ME.parent.parent / "click-menu.conf")  # beside tmux.conf
 KINDS = ("tmux:", "sh:")
 GAP = re.compile(r"\t+| {2,}")  # between fields: tabs, or two spaces and more
 ON_CLICK = "#{==:#{mouse_status_range},click}"  # true for a mouse key on tmux.conf's range=user|click
@@ -98,7 +98,7 @@ def popup(client: str, pane: str, title: str, code: str) -> None:
     """zsh code in a popup over the client: -i for his aliases and PATH, -EE keeps a failure on screen."""
     path = tmux("display-message", "-p", "-t", pane, "#{pane_current_path}").stdout.strip() or str(Path.home())
     tmux("display-popup", "-EE", "-c", client, "-w", "90%", "-h", "85%", "-d", path, "-T", f" {title} ",
-         "-e", f"STATUS_PANE={pane}", "-e", f"STATUS_CLIENT={client}", "zsh", "-ic", code)
+         "-e", f"STATUS_PANE={pane}", "-e", f"STATUS_CLIENT={client}", "-e", f"STATUS_MENU={MENU}", "zsh", "-ic", code)
 
 
 def do(client: str, pane: str, number: str) -> None:
@@ -125,7 +125,7 @@ def main(args: list[str]) -> int:
         case ["--do", client, pane, number]:
             do(client, pane, number)
         case ["--edit", client, pane]:
-            popup(client, pane, "click-menu.conf", f"${{EDITOR:-nvim}} {shlex.quote(str(MENU))}")
+            popup(client, pane, "click-menu.conf", "${EDITOR:-nvim} $STATUS_MENU")
         case ["--bind"]:
             bind()
         case [client, pane] if not client.startswith("-"):

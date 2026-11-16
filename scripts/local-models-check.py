@@ -214,6 +214,23 @@ class Window(unittest.TestCase):
         self.wait(lambda: not any(w.endswith(":local-models") for w in self.windows()), self.windows)
         self.assertEqual(view(), before)
 
+    def test_a_relay_it_did_not_start_is_still_running_after_the_window_closes(self):
+        """Someone else's relay is doing the work (the stub Ollama answers): used, never stopped."""
+        theirs = self.tmp / "ollama-relay"
+        theirs.write_text("#!/bin/sh\nexec sleep 600\n")
+        theirs.chmod(0o755)
+        other = subprocess.Popen([str(theirs)], start_new_session=True)
+        self.addCleanup(other.kill)
+        self.ollama.loaded = [ON_CPU]
+        self.toggle()
+        self.wait_title("cpu-gpt-oss:20b · 14.0G RAM · 0.0G GPU · 16k")
+        poller = self.of("#{pane_pid}")
+        self.toggle()
+        self.wait(lambda: not os.path.exists(f"/proc/{poller}"), lambda: "the poller is still running")
+        time.sleep(0.5)
+        self.assertIsNone(other.poll())  # theirs: still running
+        self.assertEqual(self.relays(), [])  # and none of ours was ever started
+
     def test_with_no_session_called_main_it_opens_where_the_toggle_ran(self):
         self.toggle()
         self.assertIn("elsewhere:local-models", self.windows())

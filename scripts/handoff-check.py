@@ -153,12 +153,12 @@ class Server:
                               env={**self.stubs(), "TMUX_PANE": pane, "HANDOFF_OUT": str(self.dir / "out"), **env},
                               timeout=30)
 
-    def pressed(self):
+    def pressed(self, **env):
         """What prefix+T runs, from the server's first pane, and the launch buffer it leaves in self.dir /
         "out". No client is attached, so the popup does not open: the pin edits the buffer in its place."""
         pane = self.tmux("list-panes", "-t", "pin:0", "-F", "#{pane_id} #{pane_pid} #{pane_current_path}").split(" ", 2)
         run = subprocess.run([sys.executable, str(HANDOFF), *pane, self.session, ""], capture_output=True, text=True,
-                             env={**self.stubs(), "HANDOFF_OUT": str(self.dir / "out")}, timeout=30)
+                             env={**self.stubs(), "HANDOFF_OUT": str(self.dir / "out"), **env}, timeout=30)
         if run.returncode:
             raise AssertionError(f"handoff.py (the press) exited {run.returncode}: {run.stdout}{run.stderr}")
         return next((self.dir / "out").glob("*.launch.md"))
@@ -299,6 +299,8 @@ class Preset(unittest.TestCase):
                 want, want_note = handoff.parse_buffer(section)
                 got, got_note = handoff.parse_buffer(self.buf.read_text())
                 self.assertEqual(handoff.problems(got, live_values()), [])
+                if "dir" in want:  # a press fills a preset's dir: in, as it does handoff.toml's
+                    want["dir"] = handoff.recommend(want["dir"], "/home/lucas/pin", None)
                 for key, default in defaults.items():
                     self.assertEqual(got.get(key), {**want, "preset": name}.get(key, default), key)
                 self.assertEqual(got_note, want_note)
@@ -603,7 +605,7 @@ class Branch(unittest.TestCase):
         self.assertNotIn("Load these skills", argv[-1])  # red-team sets skills: ""
 
     def test_what_cannot_launch_is_refused_with_the_reason(self):
-        for asked, why in [("---\ndir: /tmp\n---\n\nx\n", "no field named dir"),
+        for asked, why in [("---\ncolour: red\n---\n\nx\n", "no field named colour"),
                            ("---\nold: close\n---\n\nx\n", "old: close would end the session that is asking"),
                            ("---\neffort: enormous\n---\n\nx\n", "effort: enormous is not one of low medium high xhigh max"),
                            ("---\npreset: no-such\n---\n\nx\n", "preset: no-such is not one of")]:
@@ -624,6 +626,119 @@ class Branch(unittest.TestCase):
         note = handoff.branch_note({"pane": "%522", "name": "control-b5", "result": "/x/r.md"})
         self.assertIn("a branch of the session named control-b5 (pane %522)", note)
         self.assertIn("write the result to /x/r.md and tell control-b5 with SendMessage", note)
+
+
+class NewDir(unittest.TestCase):
+    """target: new-dir, and the dir: a press recommends for it. ~/research is never touched: the pins give
+    handoff.py a presets file whose research root is a temp directory (HANDOFF_PRESETS)."""
+
+    def panes(self, s):
+        """{window name: its pane's directory} of the pin session's windows, the first (the pin's own) left out."""
+        rows = s.tmux("list-windows", "-t", "pin", "-F", "#{window_name}\t#{pane_current_path}").splitlines()[1:]
+        return dict(row.split("\t") for row in rows)
+
+    def with_target(self, project, target, path):
+        text = default_buffer(str(project))
+        return re.sub(r"^dir:.*$", f"dir:    {path}", re.sub(r"^target:.*$", f"target: {target}", text, flags=re.M), flags=re.M)
+
+    def test_the_recommended_dir_is_a_slug_that_is_not_there_yet(self):
+        with tempfile.TemporaryDirectory() as root:
+            pane = Path(root) / "Ferry Lab"
+            pane.mkdir()
+            self.assertEqual(handoff.recommend("{parent}/{slug}", str(pane), "Open Spec: research!"), f"{root}/open-spec-research")
+            self.assertEqual(handoff.recommend("{parent}/{slug}", str(pane), None), f"{root}/ferry-lab")
+            (Path(root) / "ferry-lab").mkdir()
+            (Path(root) / "ferry-lab-2").touch()  # a file is in the way as much as a directory
+            self.assertEqual(handoff.recommend("{parent}/{slug}", str(pane), None), f"{root}/ferry-lab-3")
+        self.assertEqual(handoff.recommend("~/{slug}", "/x", "no such directory here 1794"), "~/no-such-directory-here-1794")
+        self.assertEqual(handoff.recommend(f"{Path.home()}/{{slug}}", "/x", "no such directory here 1794"),
+                         "~/no-such-directory-here-1794")  # home is written ~
+
+    def test_the_default_is_here_with_a_dir_filled_in_beside_it(self):
+        fields, _ = handoff.parse_buffer(default_buffer("/home/lucas/pin"))
+        self.assertEqual((fields["target"], fields["dir"]), ("here", handoff.recommend("{parent}/{slug}", "/home/lucas/pin", None)))
+        self.assertFalse(os.path.exists(os.path.expanduser(fields["dir"])))
+
+    def test_the_shipped_research_and_project_presets_set_a_new_dir_under_their_roots(self):
+        shipped = {name: handoff.parse_buffer(section)[0] for name, section in presets().items()}
+        self.assertEqual(shipped["research"], {"target": "new-dir", "dir": "~/research/{slug}"})
+        self.assertEqual(shipped["project"], {"target": "new-dir", "dir": "~/{slug}"})
+
+    def test_here_starts_in_the_panes_directory_under_the_programs_name(self):
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            s.launch(s.buffer(default_buffer(str(project)), project))
+            self.assertEqual(list(self.panes(s).values()), [str(project)])
+            self.assertEqual(s.tmux("list-windows", "-t", "pin", "-F", "#{automatic-rename}").splitlines()[1], "1")
+            self.assertEqual(sorted(p.name for p in s.dir.iterdir() if p.is_dir()), ["pin"])  # nothing was made
+
+    def test_a_press_with_the_research_preset_shows_a_dir_that_is_not_there_and_the_launch_makes_it(self):
+        with Server() as s:
+            root = s.dir / "research-root"
+            root.mkdir()
+            shipped = PRESETS.read_text()
+            self.assertIn("~/research/{slug}", shipped)
+            stand_in = s.dir / "presets.md"
+            stand_in.write_text(shipped.replace("~/research/{slug}", f"{root}/{{slug}}"))
+            env = {"HANDOFF_PRESETS": str(stand_in)}
+            buf = s.pressed(**env)
+            slug = handoff.slug(s.dir.name)  # no Claude in the pin's pane: the pane directory's name
+            (root / slug).mkdir()            # taken, so the press has to count on
+            buf = s.pressed(**env)
+            before, _ = handoff.parse_buffer(buf.read_text())
+            beside = handoff.recommend("{parent}/{slug}", str(s.dir), None)  # with no preset: beside the pane's own
+            self.assertEqual((before["target"], before["dir"]), ("here", beside))
+            self.assertEqual(Path(beside).parent, s.dir.parent)
+            run = choose(buf, "research")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            fields, _ = handoff.parse_buffer(buf.read_text())
+            self.assertEqual((fields["target"], fields["dir"]), ("new-dir", str(root / f"{slug}-2")))
+            self.assertFalse((root / f"{slug}-2").exists())
+            run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True, text=True,
+                                 env=s.stubs(), timeout=30)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            s.started()
+            self.assertTrue((root / f"{slug}-2").is_dir())
+            self.assertEqual(self.panes(s), {f"{slug}-2": str(root / f"{slug}-2")})  # the window is named after it
+
+    def test_a_dir_that_is_there_or_has_no_parent_is_refused_and_nothing_is_made(self):
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            (s.dir / "taken").mkdir()
+            for path, why in [(s.dir / "taken", "is there already"), (s.dir / "no" / "parent", "is not a directory"),
+                              ("", "dir: is empty")]:
+                with self.subTest(dir=str(path)):
+                    buf = s.buffer(self.with_target(project, "new-dir", f'"{path}"'), project)
+                    before = sorted(p.name for p in s.dir.rglob("*") if p.is_dir())
+                    run = subprocess.run([sys.executable, str(HANDOFF), "--launch", str(buf)], capture_output=True,
+                                         text=True, env=s.stubs(), timeout=30)
+                    self.assertIn("not launched", run.stdout)
+                    self.assertIn(why, run.stdout)
+                    self.assertEqual(len(s.windows()), 1)
+                    self.assertEqual(sorted(p.name for p in s.dir.rglob("*") if p.is_dir()), before)
+
+    def test_the_buffer_refuses_to_write_a_dir_that_is_there(self):
+        """The same rule in nvim, before :wq: the buffer stays as it was and the exit code aborts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = Path(tmp) / "pin.launch.md"
+            press(buf)
+            before = buf.read_text()
+            run = edit(buf, "%s/^target:.*/target: new-dir/", f"%s#^dir:.*#dir:    {tmp}#")
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn("is there already", run.stderr)
+            self.assertEqual(buf.read_text(), before)
+            run = edit(buf, "%s/^target:.*/target: new-dir/", f"%s#^dir:.*#dir:    {tmp}/fresh#")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertFalse((Path(tmp) / "fresh").exists())  # the buffer only checks; the launch makes it
+
+    def test_a_branch_can_ask_for_a_new_dir_too(self):
+        with Server() as s:
+            run = s.branch(f"---\ntarget: new-dir\ndir: {s.dir}/branched\n---\n\nlook into it\n")
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            s.started()
+            self.assertEqual(self.panes(s), {"branched": str(s.dir / "branched")})
 
 
 if __name__ == "__main__":

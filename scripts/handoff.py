@@ -29,6 +29,10 @@ the way parse_buffer does.
 A preset (handoff-presets.md, laid out the same way) fills in the fields it sets; handoff-buffer.lua does
 that as you type, with completion and checks. :wq launches claude in a new window with those settings and
 the prompt (empty is fine: context only); :q, :q! and :cq leave without launching.
+
+The window starts in the pane's directory (target: here), or in a directory made for it (target: new-dir,
+which makes dir: and names the window after it). dir: arrives filled with a path that does not exist yet
+(recommend()), so new-dir alone is enough; the research and project presets set both.
 """
 import importlib.util
 import json
@@ -73,6 +77,7 @@ BUFFER_LUA = Path(__file__).with_name("handoff-buffer.lua")
 WRAPPER = 'trap : INT; "$0" "$@"; exec zsh'
 # Set in a branch's window (launch()), so branch() can refuse there: a branch does not branch again.
 BRANCH_ENV = "HANDOFF_BRANCH"
+TARGETS = ["here", "new-dir"]  # target: the pane's directory, or dir:, made new
 # panel.py already knows which "user" lines are Lucas and which are injected reminders; reuse that, unedited.
 _loader = SourceFileLoader("panel", str(HOME / ".local/bin/panel.py"))
 panel = sys.modules["panel"] = importlib.util.module_from_spec(importlib.util.spec_from_loader("panel", _loader))
@@ -215,12 +220,42 @@ def skill_docs():
     return {name: [badge.description(p), str(p)] for name, p in found.items()}
 
 
+def slug(text):
+    """A directory name from a session's name: lower case, one - for each run of anything else."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def recommend(template, pane_path, name):
+    """dir: as a press fills it in, a path that does not exist yet. {parent} is the pane directory's parent
+    and {slug} the old session's name, else the pane directory's; then -2, -3 until nothing is there.
+    Home is written ~, which launch() and the checks read back."""
+    base = (template.replace("{parent}", str(Path(pane_path).parent))
+            .replace("{slug}", slug(name or "") or slug(Path(pane_path).name) or "new"))
+    path, n = base, 1
+    while os.path.exists(os.path.expanduser(path)):
+        n += 1
+        path = f"{base}-{n}"
+    return "~" + path[len(str(HOME)):] if path.startswith(f"{HOME}/") else path
+
+
+def dir_problem(path):
+    """Why target: new-dir cannot make this dir:, or "". handoff-buffer.lua says the same."""
+    if not path:
+        return "dir: is empty; target new-dir needs the directory to make"
+    path = os.path.expanduser(path)
+    if os.path.lexists(path):
+        return f"dir: {path} is there already; target new-dir makes a new directory"
+    if not os.path.isdir(os.path.dirname(path) or "."):
+        return f"dir: {os.path.dirname(path)} is not a directory; target new-dir makes one level"
+    return ""
+
+
 def presets(auto):
     """{name: (fields, prompt)}: auto (the press's usual skills) and none, then handoff-presets.md's,
     each laid out like a launch buffer."""
     found = {"auto": ({"skills": " ".join(auto)}, ""), "none": ({"skills": ""}, "")}
     try:
-        text = PRESETS.read_text()
+        text = (Path(os.environ["HANDOFF_PRESETS"]) if os.environ.get("HANDOFF_PRESETS") else PRESETS).read_text()
     except OSError:
         return found
     # a preset starts at a `## name` with --- under it, so a ## heading in its prompt stays in the prompt
@@ -259,6 +294,7 @@ def allowed_values():
         "others": OVERRIDE_STATES,
         "old": ["keep", "close"],
         "send": ["yes", "no"],
+        "target": TARGETS,
         "preset": list(presets([])),
     }
 
@@ -320,8 +356,9 @@ def problems(fields, values):
     bad = [f"{key}: {value!r} is a YAML list or map; write it as one line of text"
            for key, value in fields.items() if not isinstance(value, str)]
     model = fields.get("model", "") if isinstance(fields.get("model", ""), str) else ""
-    for key in ("model", "effort", "preset", "others", "old"):
-        value, allowed = fields.get(key, ""), values.get(key) or []
+    for key in ("model", "effort", "preset", "others", "old", "target"):
+        # no target: line is here, as it was before there was one
+        value, allowed = fields.get(key, "here" if key == "target" else ""), values.get(key) or []
         if not isinstance(value, str):
             continue
         if key == "effort":
@@ -334,6 +371,8 @@ def problems(fields, values):
                        + (f" (what {model} supports)" if key == "effort" and model else ""))
     if fields.get("send") == "no" and provider(model, values) == "codex":
         bad.append(NO_SEND_CODEX)
+    if fields.get("target") == "new-dir" and isinstance(fields.get("dir", ""), str) and dir_problem(fields.get("dir", "")):
+        bad.append(dir_problem(fields.get("dir", "")))
     return bad
 
 
@@ -346,17 +385,21 @@ def provider(model, values):
     return known["provider"] if known else "codex" if model.startswith("gpt-") else "claude"
 
 
-def press(cwd, chosen, values):
+def press(cwd, chosen, values, name=None):
     """What one press builds the buffer from, written beside it for handoff-buffer.lua: the allowed
-    values, handoff.toml's fields and defaults, the presets, and each skill's description and path."""
+    values, handoff.toml's fields and defaults, the presets, and each skill's description and path.
+    name is the old session's, for dir: (recommend()); every dir: here, a preset's too, is filled in."""
     cfg = tomllib.loads(CONFIG.read_text())
     defaults = {key: value.replace("{dir}", Path(cwd).name) for key, value in cfg["defaults"].items()}
     defaults["skills"] = " ".join(chosen)  # the auto preset's
+    defaults["dir"] = recommend(defaults.get("dir", ""), cwd, name)
+    found = {preset: ({**f, "dir": recommend(f["dir"], cwd, name)} if isinstance(f.get("dir"), str) else f, prompt)
+             for preset, (f, prompt) in presets(chosen).items()}
     # "keep: leaves the old session running; close: ..." in the help is what completion shows beside each value
     value_docs = {key: {v: d.strip() for v, d in re.findall(r"([\w-]+): ([^;]+)", text) if v in (values.get(key) or [])}
                   for key, text in cfg["help"].items()}
     return {**values, "config": cfg, "defaults": defaults, "order": list(dict.fromkeys([*cfg["show"], *defaults])),
-            "presets": {name: {"fields": f, "prompt": p} for name, (f, p) in presets(chosen).items()},
+            "presets": {preset: {"fields": f, "prompt": prompt} for preset, (f, prompt) in found.items()},
             "skill_docs": skill_docs(), "value_docs": value_docs}
 
 
@@ -458,7 +501,7 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
              f"handoff: session cwd {cwd} differs from pane {pane_path}; using the pane's")
 
     chosen, seen = skill_defaults(pane_path, transcript)
-    p = press(pane_path, chosen, allowed_values())
+    p = press(pane_path, chosen, allowed_values(), (info or {}).get("name"))
     buffer = stem.with_suffix(".launch.md")
     text = render(p, seen)
     buffer.write_text(text)
@@ -588,11 +631,23 @@ def launch(buffer):
     # A branch opens behind the current window (-d): Lucas's view stays where it is. It also carries
     # BRANCH_ENV, which branch() refuses on.
     quiet = ["-d", "-e", f"{BRANCH_ENV}={branched.get('name') or branched['pane']}"] if branched else []
+    # target new-dir: the directory is made here, one level (problems() saw that nothing is there and its
+    # parent is), and the window is named after it, which is also the role its title shows.
+    where, fresh = ctx["dir"], fields.get("target") == "new-dir"
+    if fresh:
+        where = os.path.expanduser(fields["dir"])
+        try:
+            os.mkdir(where)
+        except OSError as e:
+            return say(ctx["client"], f"handoff: not launched; could not make {where}: {e.strerror}")
+        quiet += ["-n", Path(where).name]
     made = subprocess.run(["tmux", "new-window", *quiet, "-P", "-F", "#{pane_id} #{session_name}:#{window_index}",
-                           "-t", ctx["session"], "-c", ctx["dir"],
+                           "-t", ctx["session"], "-c", where,
                            "-e", f"PATH={bin_on_path(argv[0])['PATH']}", "zsh", "-c", WRAPPER, *argv],
                           capture_output=True, text=True)
     if made.returncode:  # printed too: the popup (-EE) stays open on a non-zero exit
+        if fresh:
+            os.rmdir(where)  # ours, and still empty: nothing started in it
         why = made.stderr.strip() or f"tmux new-window exited {made.returncode}"
         print(f"handoff: not launched; {why}")
         if ctx["client"]:
@@ -648,7 +703,7 @@ def branch(file):
     pane_pid, session_id, pane_path = here.split(" ", 2)
     stem, info, transcript, _ = export_pane(pane, pane_pid, pane_path)
     chosen, seen = skill_defaults(pane_path, transcript)
-    p = press(pane_path, chosen, allowed_values())
+    p = press(pane_path, chosen, allowed_values(), (info or {}).get("name"))
     unknown = sorted(set(asked) - set(p["defaults"]))
     if unknown:
         sys.exit(f"handoff: not branched; no field named {', '.join(unknown)}. The fields are {' '.join(p['order'])}")

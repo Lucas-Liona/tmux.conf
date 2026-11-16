@@ -9,7 +9,7 @@ local values = vim.json.decode(table.concat(vim.fn.readfile((name:gsub("%.launch
 local ns = vim.api.nvim_create_namespace("handoff")
 local draw = vim.api.nvim_create_namespace("handoff-draw")
 local ERROR, WARN = vim.diagnostic.severity.ERROR, vim.diagnostic.severity.WARN
-local CHECKED = { "model", "effort", "preset", "others", "old", "send" } -- a bad one blocks :wq; skills only warn
+local CHECKED = { "model", "effort", "preset", "others", "old", "send", "target" } -- a bad one blocks :wq; skills only warn
 local docs, presets, defaults, models = values.skill_docs, values.presets, values.defaults, values.models or {}
 local known, shown = {}, {}
 for _, skill in ipairs(values.skills) do known[skill] = true end
@@ -161,6 +161,17 @@ local function problems(s)
   if codex and (send and send.value or defaults.send) == "no" then -- handoff.py's NO_SEND_CODEX
     table.insert(out, { lnum = send and send.lnum or s.bars[1], col = send and send.col or 0, severity = ERROR,
       message = "send: no works with claude only: codex shows no input box this can tell is ready" })
+  end
+  if (s.fields.target and s.fields.target.value or defaults.target) == "new-dir" then -- handoff.py's dir_problem()
+    local f = s.fields.dir
+    local path = ((f and f.value or defaults.dir or ""):gsub("^~", vim.env.HOME))
+    local stat, parent = (vim.uv or vim.loop).fs_stat, vim.fs.dirname(path)
+    local why = path == "" and "dir: is empty; target new-dir needs the directory to make"
+      or (vim.uv or vim.loop).fs_lstat(path) and ("dir: %s is there already; target new-dir makes a new directory"):format(path)
+      or (stat(parent) or {}).type ~= "directory" and ("dir: %s is not a directory; target new-dir makes one level"):format(parent)
+    if why then
+      table.insert(out, { lnum = f and f.lnum or s.bars[1], col = f and f.col or 0, severity = ERROR, message = why })
+    end
   end
   local skills = s.fields.skills
   for skill in (skills and skills.value or ""):gmatch("[^,%s]+") do

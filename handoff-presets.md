@@ -2,6 +2,19 @@
 # A preset is laid out like the buffer: YAML frontmatter between two --- lines with the fields it sets
 # (by the same names; a field left out keeps its default), then the new session's first prompt.
 # auto and none are built in: auto is this directory's usual skills, none is no skills.
+# A dir: here is filled in on each press like handoff.toml's: {slug} is the old session's name.
+
+## research
+---
+target: new-dir
+dir:    ~/research/{slug}
+---
+
+## project
+---
+target: new-dir
+dir:    ~/{slug}
+---
 
 ## red-team
 ---

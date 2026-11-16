@@ -233,6 +233,28 @@ class Click(unittest.TestCase):
         self.keys("Escape")
         self.tmux(self.inner, "select-window", "-t", self.pane)
 
+    def test_the_last_session_beside_it_is_a_button_too(self):
+        """A left click on "⇄ name" goes there, and the same spot then leads back."""
+        client = self.tmux(self.inner, "list-clients", "-F", "#{client_name}")
+        session = lambda: self.tmux(self.inner, "list-clients", "-F", "#{client_session}")
+        self.tmux(self.inner, "new-session", "-d", "-s", "elsewhere", "cat")
+        try:
+            self.assertIsNone(self.where("⇄"))  # no last session yet: nothing drawn
+            self.tmux(self.inner, "switch-client", "-c", client, "-t", "elsewhere")
+            self.tmux(self.inner, "switch-client", "-c", client, "-t", "riverboat")
+            for there, back in (("elsewhere", "riverboat"), ("riverboat", "elsewhere")):
+                self.wait_for(f"⇄ {there}")
+                self.click(f"⇄ {there}")
+                self.wait_for(f"⇄ {back}")
+                self.assertEqual(session(), there)
+            self.click("⇄ elsewhere", RIGHT)  # not the editor: the bar's stock menu, as anywhere else
+            self.wait_for("Swap Left")
+            self.keys("Escape")
+            self.assertEqual(session(), "riverboat")
+        finally:
+            self.tmux(self.inner, "switch-client", "-c", client, "-t", "riverboat")
+            self.tmux(self.inner, "kill-session", "-t", "=elsewhere")
+
     def test_binding_twice_wraps_once(self):
         before = self.tmux(self.inner, "list-keys", "-T", "root", "MouseDown3Status")
         self.assertEqual(before.count("mouse_status_range"), 1, before)

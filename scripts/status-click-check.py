@@ -59,7 +59,7 @@ class Parse(unittest.TestCase):
         got = status_click.items(DEFAULTS.read_text())
         self.assertEqual([item for item in got if item[3] is None], [])
         self.assertEqual([item[1] for item in got if item[3]],
-                         ["panel", "aq", "skills in this pane", "hand off (prefix T)", "new session", "ask claude",
+                         ["panel", "aq", "local models", "skills in this pane", "hand off (prefix T)", "new session", "ask claude",
                           "edit this menu"])
 
 

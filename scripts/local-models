@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""The local-models window: what the Windows Ollama has loaded, as a tile in the workmux sidebar.
+
+    local-models             the window's program: reach Ollama, register with workmux, keep the title current
+    local-models --toggle    the ⌘ menu's line: open that window in session main, or close it
+
+A sidebar tile is a pane workmux knows as an agent, and its text is the pane's title. So this
+registers its own pane the way Claude's hooks do (workmux register-agent, then set-window-status)
+and sets the title every few seconds from Ollama's GET /api/ps, which lists what is loaded and
+loads nothing:
+
+    cpu-gpt-oss:20b · 14.0G RAM · 0.0G GPU · 16k     a model is loaded (status: working)
+    ollama: nothing loaded                            none is (status: done)
+    ollama: unreachable                               no answer from the relay or from Ollama
+
+RAM is size minus size_vram: Ollama's size is the whole model and size_vram the part of it on the
+GPU (github.com/ollama/ollama, docs/api.md, "List Running Models").
+
+Ollama runs on Windows and listens on its loopback only; ~/golf/ollama-relay carries WSL
+127.0.0.1:11435 to it. If nothing answers there this starts the relay as its own child and stops
+it on every way out. A relay someone else started is used and left alone.
+"""
+import atexit
+import ctypes
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ME = Path(__file__).resolve()
+WINDOW = "local-models"
+PORT = os.environ.get("LOCAL_MODELS_PORT", "11435")  # these four overrides: for checking
+RELAY = os.environ.get("LOCAL_MODELS_RELAY", str(Path.home() / "golf/ollama-relay"))
+WORKMUX = os.environ.get("LOCAL_MODELS_WORKMUX", "workmux")
+EVERY = float(os.environ.get("LOCAL_MODELS_EVERY", "5"))
+UNREACHABLE, NOTHING = "ollama: unreachable", "ollama: nothing loaded"
+
+
+def get(path: str):
+    """Ollama's answer to GET path as parsed JSON, or None when there is none."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}{path}", timeout=3) as reply:
+            return json.load(reply)
+    except (OSError, ValueError):
+        return None
+
+
+def gigs(size: int) -> str:
+    return f"{size / 1e9:.1f}G"
+
+
+def title(ps) -> str:
+    """The tile's text from /api/ps's answer. More than one model loaded: the first, and how many more."""
+    if not isinstance(ps, dict):
+        return UNREACHABLE
+    models = ps.get("models") or []
+    if not models:
+        return NOTHING
+    first = models[0]
+    size, gpu = first.get("size") or 0, first.get("size_vram") or 0
+    parts = [first.get("name") or "?", f"{gigs(size - gpu)} RAM", f"{gigs(gpu)} GPU"]
+    if first.get("context_length"):
+        parts.append(f"{first['context_length'] // 1024}k")
+    return " · ".join(parts) + (f" +{len(models) - 1}" if len(models) > 1 else "")
+
+
+def quiet(*argv: str) -> None:
+    """Run and forget. stdin is closed: workmux reads a hook's input there and would wait for it."""
+    try:
+        subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+class Relay:
+    """ollama-relay as our child, started only when nothing answers; None while someone else's does the work."""
+    child = None
+
+    def start(self) -> None:
+        if self.child and self.child.poll() is None:
+            return
+        # Its own process group, to stop it with the PowerShell it keeps per open connection. And the kernel
+        # ends it should this script die without the chance to (prctl PR_SET_PDEATHSIG): no way out leaves it.
+        orphan_too = lambda: ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+        try:
+            self.child = subprocess.Popen([RELAY], env={**os.environ, "RELAY_PORT": PORT}, start_new_session=True,
+                                          preexec_fn=orphan_too, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL)
+        except OSError:
+            self.child = None
+
+    def stop(self) -> None:
+        if self.child and self.child.poll() is None:
+            try:
+                os.killpg(self.child.pid, signal.SIGTERM)
+                self.child.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def draw(text: str, tags) -> None:
+    """The pane itself, for whoever opens the window: the tile's line, then every model Ollama has on disk."""
+    lines = [text, ""]
+    for model in (tags or {}).get("models") or []:
+        lines.append(f"  {model.get('name', '?'):<34} {gigs(model.get('size') or 0):>7}")
+    lines += ["", f"  http://127.0.0.1:{PORT}/api/ps, read {time.strftime('%H:%M:%S')}; this window closes from the ⌘ menu"]
+    sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def watch() -> int:
+    pane, relay = os.environ.get("TMUX_PANE"), Relay()
+    if not pane:
+        sys.exit("local-models: this is the program of a tmux window; run local-models --toggle")
+    atexit.register(relay.stop)
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):  # the window killed, the server going, Ctrl+C
+        signal.signal(sig, lambda *_: sys.exit(0))
+    shown = status = None
+    while True:
+        ps = get("/api/ps")
+        if ps is None:
+            relay.start()  # nobody's relay answers: ours, from now until this window closes
+            time.sleep(min(1, EVERY))
+            ps = get("/api/ps")
+        text = title(ps)
+        if text != shown:
+            quiet("tmux", "select-pane", "-t", pane, "-T", text)
+        if shown is None:  # after the first title: workmux's record keeps the title the pane had when it registered
+            quiet(WORKMUX, "register-agent")
+        want = "working" if text not in (UNREACHABLE, NOTHING) else "done"
+        if want != status:
+            quiet(WORKMUX, "set-window-status", want)
+        shown, status = text, want
+        draw(text, get("/api/tags") if ps is not None else None)
+        time.sleep(EVERY)
+
+
+def toggle() -> int:
+    """Close every local-models window, or open one behind the window in view: in main, else this session."""
+    tmux = lambda *args: subprocess.run(["tmux", *args], capture_output=True, text=True).stdout.strip()
+    rows = [row.split("\t") for row in tmux("list-windows", "-a", "-F", "#{window_id}\t#{window_name}\t#{session_name}").splitlines()]
+    open_ones = [window for window, name, _ in rows if name == WINDOW]
+    for window in open_ones:
+        tmux("kill-window", "-t", window)
+    if not open_ones:
+        where = ["-t", "main:"] if any(session == "main" for _, _, session in rows) else []
+        tmux("new-window", "-d", *where, "-n", WINDOW, "-c", str(Path.home()), str(ME))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(toggle() if sys.argv[1:] == ["--toggle"] else watch())

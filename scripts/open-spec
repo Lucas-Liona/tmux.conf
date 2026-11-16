@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""prefix+O, "open spec": the pane's Claude prompt box in nvim, starting from the grey suggestion, unsent.
+
+    open-spec <pane> <client>
+
+Nothing is read off the screen. These are Claude Code's own two keys, sent to the pane: Right arrow
+places the grey prompt suggestion in the box, and Ctrl+G opens the box in $EDITOR. :wq puts the
+text back in the box and sends nothing; a draft already typed opens as it is, since a typed box
+shows no suggestion. (code.claude.com/docs/en/interactive-mode: "Prompt suggestions", and the
+Ctrl+G row of the shortcuts table.) Right, not Tab: with no suggestion Tab can open autocomplete.
+
+The keys go only to a pane whose front program is claude. Anywhere else they would be typed into
+a shell or an editor, so the pane gets a message on the status line and nothing else.
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+
+def tmux(*args: str) -> str:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True).stdout.strip()
+
+
+def claude_in_front(tty: str) -> bool:
+    """Whether a claude is in the terminal's foreground process group. Not pane_current_command: under the
+    zsh -c that prefix+T starts it in, that says zsh. A script's name is its second word (node, python)."""
+    rows = subprocess.run(["ps", "-o", "tpgid=,pgid=,args=", "-t", tty], capture_output=True, text=True).stdout
+    for row in rows.splitlines():
+        front, group, *words = row.split()
+        if front == group and "claude" in [Path(word).name for word in words[:2]]:
+            return True
+    return False
+
+
+def main(args: list[str]) -> int:
+    if len(args) != 2:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    pane, client = args
+    tty = tmux("display-message", "-p", "-t", pane, "#{pane_tty}")
+    if tty and claude_in_front(tty):
+        tmux("send-keys", "-t", pane, "Right", "C-g")
+    else:
+        tmux("display-message", "-c", client, "open spec: no claude in this pane")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

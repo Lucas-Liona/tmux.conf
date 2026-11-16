@@ -3,10 +3,11 @@
 
     window-models            set @claude_model on every window of the server, once; prints nothing
     window-models --adopt    tmux.conf, at load: give the label to windows that carry their own format
+    window-models --remove   take the label off this server: formats, the job, the options
 
-status-right runs this as a #() job, so tmux starts it about once per status-interval, for the
-whole server rather than once per window: starting Python costs more than everything it then does.
-The window names draw the option themselves (tmux.conf, @catppuccin_window_text).
+status-right runs window-models-job as a #() job; that starts this about once every ten seconds
+for the whole server, whatever the number of clients and redraws. The window names draw the option
+themselves (tmux.conf, @catppuccin_window_text).
 
 Which claude is in which window is read the way panel.py reads it. Each running claude keeps
 ~/.claude/sessions/<its pid>.json with its session id and directory. /proc/<pid>/stat says which
@@ -16,6 +17,11 @@ read from the end of the file: an assistant reply's model, or a /model answer af
 switch shows before the next reply. Nothing known (no claude, no reply yet) clears the option.
 Codex windows are left alone: their sessions are not in ~/.claude.
 
+A label must not outlive this job: a stale model reads exactly like a fresh one. So every run
+also stamps the server with the time (@claude_models_at), and the label draws only while that
+stamp is younger than EXPIRY seconds. If the job stops, because the script is gone or tmux.conf
+no longer starts it, every label goes blank on its own, in workmux's copies too.
+
 --adopt is for workmux. It gives each agent window its own copy of the window format, with its
 status icon added, and never refreshes that copy; a window stamped before the label existed would
 never draw it. --adopt writes the label into such copies, after the name, and leaves the rest.
@@ -23,12 +29,20 @@ never draw it. --adopt writes the label into such copies, after the name, and le
 import json
 import os
 import sys
+import time
 
 CLAUDE = os.environ.get("WINDOW_MODELS_CLAUDE") or os.path.expanduser("~/.claude")  # the override: for checking
 TAILS = (1 << 16, 1 << 20)  # bytes read from the transcript's end: a second, longer look if the first finds nothing
 ASSISTANT, MODEL = '"type":"assistant"', '"model":"claude-'
-NAME, LABEL = " #W", "#{?#{@claude_model}, · #{@claude_model},}"  # tmux.conf's @catppuccin_window_text is NAME + LABEL
 SWITCHED = ('"content":"<local-command-stdout>Set model to ', '"content":"<local-command-stdout>Kept model as ')
+# tmux.conf's @catppuccin_window_text is NAME + LABEL. %s is the time now: tmux runs a window format through
+# strftime before it reads it. EXPIRY is three of the job's turns, so one late or lost turn blanks nothing.
+EXPIRY = 30
+NAME = " #W"
+LABEL = "#{?#{&&:#{@claude_model},#{e|<:#{e|-:%s,#{@claude_models_at}}," + str(EXPIRY) + "}}, · #{@claude_model},}"
+FIRST_LABEL = "#{?#{@claude_model}, · #{@claude_model},}"  # 24b33f3's, without the expiry: live on one server for a day
+FORMATS = ("window-status-format", "window-status-current-format")
+JOBS = ("/window-models)", "/window-models-job)")  # how the #() in status-right ends, then and now
 
 
 def run(*argv: str) -> str:
@@ -106,10 +120,11 @@ def last_model(path: str) -> str:
 
 def main() -> int:
     rows = [row.split("\t") for row in run(
-        "tmux", "list-panes", "-a", "-F", "#{pane_tty}\t#{window_id}\t#{pane_active}\t#{@claude_model}").splitlines()]
-    window_of = {tty: (window, active == "1") for tty, window, active, _ in rows}
-    shown = {window: model for _, window, _, model in rows}
-    found: dict[str, tuple[bool, str]] = {}
+        "tmux", "list-panes", "-a", "-F",
+        "#{pane_tty}\t#{window_id}\t#{pane_active}\t#{pane_index}\t#{@claude_model}").splitlines()]
+    pane_of = {tty: (window, active != "1", int(index)) for tty, window, active, index, _ in rows}
+    shown = {window: model for _, window, _, _, model in rows}
+    found: dict[str, tuple[bool, int, str]] = {}
     try:
         files = os.listdir(os.path.join(CLAUDE, "sessions"))
     except OSError:
@@ -117,39 +132,70 @@ def main() -> int:
     for name in files:
         pid = name[:-5]
         tty = front_terminal(pid) if name.endswith(".json") and pid.isdigit() else ""
-        if tty not in window_of:
+        if tty not in pane_of:
             continue
         try:
             with open(os.path.join(CLAUDE, "sessions", name)) as f:
                 info = json.load(f)
         except (OSError, ValueError):
             continue
-        window, active = window_of[tty]
+        window, inactive, index = pane_of[tty]
         model = last_model(transcript(info.get("cwd") or "", info.get("sessionId") or ""))
-        if model and (window not in found or active > found[window][0]):  # two claudes in a window: the active pane's
-            found[window] = (active, model)
-    changes: list[str] = []
+        # two claudes in one window: the active pane's, else the lowest pane's, whatever order the files came in
+        if model and (window not in found or (inactive, index) < found[window][:2]):
+            found[window] = (inactive, index, model)
+    changes = ["set-option", "-s", "@claude_models_at", str(int(time.time()))]  # the stamp LABEL reads: still running
     for window, model in shown.items():
-        want = found.get(window, (False, ""))[1]
+        want = found[window][2] if window in found else ""
         if want != model:
-            changes += ["set-option", "-w", "-t", window, "@claude_model", want, ";"] if want else \
-                       ["set-option", "-wu", "-t", window, "@claude_model", ";"]
-    if changes:
-        run("tmux", *changes[:-1])
+            changes += [";", "set-option", "-w", "-t", window, "@claude_model", want] if want else \
+                       [";", "set-option", "-wu", "-t", window, "@claude_model"]
+    run("tmux", *changes)
     return 0
 
 
 def adopt() -> int:
     for window in run("tmux", "list-windows", "-a", "-F", "#{window_id}").split():
-        for option in ("window-status-format", "window-status-current-format"):
+        for option in FORMATS:
             own = run("tmux", "show-options", "-wqv", "-t", window, option).rstrip("\n")  # "" when it has no copy
-            if own.count(NAME) == 1 and LABEL not in own:
-                run("tmux", "set-option", "-w", "-t", window, option, own.replace(NAME, NAME + LABEL))
+            new = own.replace(FIRST_LABEL, LABEL) if FIRST_LABEL in own else own
+            if new.count(NAME) == 1 and LABEL not in new:
+                new = new.replace(NAME, NAME + LABEL)
+            if new != own:
+                run("tmux", "set-option", "-w", "-t", window, option, new)
+    return 0
+
+
+def remove() -> int:
+    """Everything this script put on the server, gone: for a revert, where tmux.conf no longer knows any of it.
+    While tmux.conf still has the label, its next load puts the label back."""
+    def plain(text: str) -> str:
+        return text.replace(LABEL, "").replace(FIRST_LABEL, "")
+
+    for option in FORMATS:
+        was = run("tmux", "show-options", "-gqv", option).rstrip("\n")
+        if plain(was) != was:
+            run("tmux", "set-option", "-g", option, plain(was))
+    right = run("tmux", "show-options", "-gqv", "status-right").rstrip("\n")
+    kept, rest = "", right
+    while "#(" in rest:  # cut each #(...) that runs this script or its job, keep the others (continuum's)
+        before, _, after = rest.partition("#(")
+        command, closed, rest = after.partition(")")
+        kept += before + ("" if closed and (command + ")").endswith(JOBS) else "#(" + command + closed)
+    if kept + rest != right:
+        run("tmux", "set-option", "-g", "status-right", kept + rest)
+    for window in run("tmux", "list-windows", "-a", "-F", "#{window_id}").split():
+        for option in FORMATS:
+            own = run("tmux", "show-options", "-wqv", "-t", window, option).rstrip("\n")
+            if plain(own) != own:
+                run("tmux", "set-option", "-w", "-t", window, option, plain(own))
+        run("tmux", "set-option", "-wu", "-t", window, "@claude_model")
+    run("tmux", "set-option", "-su", "@claude_models_at")
     return 0
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(adopt() if sys.argv[1:] == ["--adopt"] else main())
+        sys.exit({"--adopt": adopt, "--remove": remove}.get("".join(sys.argv[1:2]), main)())
     except Exception:  # a #() job's output is drawn on the bar: stay silent
         sys.exit(0)

@@ -1,0 +1,22 @@
+#!/bin/sh
+# status-right's #() job for the model labels: starts window-models, at most once every EVERY
+# seconds for the whole server.
+#
+# tmux runs a #() job whenever a client's status line is redrawn in a new second, and keeps one
+# job per client (tmux 3.4, format.c, format_job_get), so with agents redrawing the bar all day
+# the job runs most seconds, once for each attached client. Starting Python that often costs more
+# than the labels are worth. This shell gate costs about five milliseconds: it reads the time of
+# the last start from a file beside the server's socket and leaves unless that is EVERY seconds
+# old. 9: the labels can lag ten seconds, and every second five-second redraw of the bar finds the
+# gate open. Under load a start costs 0.15 s or more (Python, two tmux round trips), so not more often.
+#
+# window-models then runs in the background with its output closed, so the job is done at once
+# and tmux never draws "<... not ready>" for it, however slow a start is.
+EVERY=9
+stamp="${TMUX%%,*}.window-models"
+now=$(date +%s)
+last=0
+[ -r "$stamp" ] && read -r last < "$stamp"
+[ $((now - ${last:-0})) -lt "$EVERY" ] && exit 0
+echo "$now" > "$stamp"
+"${0%/*}/window-models" > /dev/null 2>&1 &

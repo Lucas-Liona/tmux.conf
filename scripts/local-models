@@ -1,71 +1,106 @@
 #!/usr/bin/env python3
-"""The local-models window: what the Windows Ollama has loaded, as a tile in the workmux sidebar.
+"""The local-models window: what fleet saw on every model surface, as a tile in the workmux sidebar.
 
-    local-models             the window's program: reach Ollama, register with workmux, keep the title current
+    local-models             the window's program: read fleet.json, register with workmux, keep the title current
     local-models --toggle    the ⌘ menu's line: open that window in session main, or close it
 
 A sidebar tile is a pane workmux knows as an agent, and its text is the pane's title. So this
 registers its own pane the way Claude's hooks do (workmux register-agent, then set-window-status)
-and sets the title every few seconds from Ollama's GET /api/ps, which lists what is loaded and
-loads nothing:
+and sets the title every few seconds from ~/.cache/panel/fleet.json, which `fleet --write` rewrites
+each minute (fleet.timer). This asks nothing of Ollama, CT 100 or MLflow itself: fleet does, once,
+for every surface (tmux bar, sidebar, Zebar).
 
-    cpu-gpt-oss:20b · 14.0G RAM · 0.0G GPU · 16k     a model is loaded (status: working)
-    ollama: nothing loaded                            none is (status: done)
-    ollama: unreachable                               no answer from the relay or from Ollama
+    nomic-embed-text 0.3G · ct100 idle · 9 runs · pi not installed
+    fleet: no snapshot                     the file is missing or unreadable
+    fleet: stale since 06:33               fleet.timer has not rewritten it for STALE seconds
 
-RAM is size minus size_vram: Ollama's size is the whole model and size_vram the part of it on the
-GPU (github.com/ollama/ollama, docs/api.md, "List Running Models").
-
-Ollama runs on Windows and listens on its loopback only; ~/golf/ollama-relay carries WSL
-127.0.0.1:11435 to it. If nothing answers there this starts the relay as its own child and stops
-it on every way out. A relay someone else started is used and left alone.
+"runs" are MLflow runs marked RUNNING; a crashed run stays marked, so they do not make the tile
+"working". A loaded model anywhere does.
 """
-import atexit
-import ctypes
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
-import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 ME = Path(__file__).resolve()
 WINDOW = "local-models"
-PORT = os.environ.get("LOCAL_MODELS_PORT", "11435")  # these four overrides: for checking
-RELAY = os.environ.get("LOCAL_MODELS_RELAY", str(Path.home() / "golf/ollama-relay"))
+FLEET = Path(os.environ.get("LOCAL_MODELS_FLEET", str(Path.home() / ".cache/panel/fleet.json")))  # overrides: for checking
 WORKMUX = os.environ.get("LOCAL_MODELS_WORKMUX", "workmux")
 EVERY = float(os.environ.get("LOCAL_MODELS_EVERY", "5"))
-UNREACHABLE, NOTHING = "ollama: unreachable", "ollama: nothing loaded"
+STALE = 180  # fleet.timer runs each minute: three missed runs
+MISSING = "fleet: no snapshot"
+SURFACES = (("wsl", "WSL Ollama", "local"), ("windows", "Windows Ollama (relay :11435)", "local"),
+            ("ct100_gpu", "CT 100 Ollama (GPU LXC)", "homelab"))
 
 
-def get(path: str):
-    """Ollama's answer to GET path as parsed JSON, or None when there is none."""
+def read():
+    """fleet.json as a dict, or None when it is missing or not JSON."""
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}{path}", timeout=3) as reply:
-            return json.load(reply)
+        snap = json.loads(FLEET.read_text())
     except (OSError, ValueError):
         return None
+    return snap if isinstance(snap, dict) else None
 
 
-def gigs(size: int) -> str:
-    return f"{size / 1e9:.1f}G"
+def stale(snap, now=None):
+    """The snapshot's "at" (HH:MM) when it is older than STALE, else None. An unreadable time is stale."""
+    try:
+        at = datetime.strptime(snap["at"], "%Y-%m-%d %H:%M")
+    except (KeyError, TypeError, ValueError):
+        return "?"
+    return at.strftime("%H:%M") if (now or time.time()) - at.timestamp() > STALE else None
 
 
-def title(ps) -> str:
-    """The tile's text from /api/ps's answer. More than one model loaded: the first, and how many more."""
-    if not isinstance(ps, dict):
-        return UNREACHABLE
-    models = ps.get("models") or []
-    if not models:
-        return NOTHING
-    first = models[0]
-    size, gpu = first.get("size") or 0, first.get("size_vram") or 0
-    parts = [first.get("name") or "?", f"{gigs(size - gpu)} RAM", f"{gigs(gpu)} GPU"]
-    if first.get("context_length"):
-        parts.append(f"{first['context_length'] // 1024}k")
-    return " · ".join(parts) + (f" +{len(models) - 1}" if len(models) > 1 else "")
+def models(snap, side, group):
+    return ((snap.get(group) or {}).get(side) or {}).get("models") or []
+
+
+def short(name: str) -> str:
+    return name[:-len(":latest")] if name.endswith(":latest") else name
+
+
+def loaded(snap) -> bool:
+    return any(models(snap, side, group) for side, _, group in SURFACES)
+
+
+def title(snap, now=None) -> str:
+    """The tile's text: local models, CT 100, MLflow runs, Pi. The sidebar shows its first ~14 characters."""
+    if snap is None:
+        return MISSING
+    old = stale(snap, now)
+    if old:
+        return f"fleet: stale since {old}"
+    local = [f"{short(m.get('name') or '?')} {m.get('gb', 0)}G" for side in ("wsl", "windows")
+             for m in models(snap, side, "local")]
+    lab = [short(m.get("name") or "?") for m in models(snap, "ct100_gpu", "homelab")]
+    mlflow = (snap.get("homelab") or {}).get("mlflow") or {}
+    runs = f"{len(mlflow.get('running') or [])} runs" if mlflow.get("up") else "mlflow down"
+    pi = "pi installed" if snap.get("pi") else "pi not installed"
+    return " · ".join([", ".join(local) or "local idle", f"ct100 {', '.join(lab) or 'idle'}", runs, pi])
+
+
+def body(snap) -> list[str]:
+    """The window itself, for whoever opens it: each surface on its own line."""
+    if snap is None:
+        return [f"  {FLEET} is missing: is fleet.timer running? (systemctl --user status fleet.timer)"]
+    lines = [f"  fleet.json written {snap.get('at', '?')}", ""]
+    for side, label, group in SURFACES:
+        up = ((snap.get(group) or {}).get(side) or {}).get("up")
+        found = models(snap, side, group)
+        what = "down" if not up else ", ".join(f"{m.get('name')} {m.get('gb', 0)}G ({m.get('gpu_gb', 0)}G GPU)"
+                                              for m in found) or "nothing loaded"
+        lines.append(f"  {label:<31} {what}")
+    mlflow = (snap.get("homelab") or {}).get("mlflow") or {}
+    running = mlflow.get("running") or []
+    lines.append(f"  {'MLflow (CT 118 sf-train runs)':<31} "
+                 + (f"{len(running)} marked running (a crashed run stays marked)" if mlflow.get("up") else "down"))
+    lines += [f"    {run}" for run in running]
+    lines.append(f"  {'Pi coding agent':<31} {'installed' if snap.get('pi') else 'not installed'}")
+    return lines
 
 
 def quiet(*argv: str) -> None:
@@ -76,66 +111,31 @@ def quiet(*argv: str) -> None:
         pass
 
 
-class Relay:
-    """ollama-relay as our child, started only when nothing answers; None while someone else's does the work."""
-    child = None
-
-    def start(self) -> None:
-        if self.child and self.child.poll() is None:
-            return
-        # Its own process group, to stop it with the PowerShell it keeps per open connection. And the kernel
-        # ends it should this script die without the chance to (prctl PR_SET_PDEATHSIG): no way out leaves it.
-        orphan_too = lambda: ctypes.CDLL(None).prctl(1, signal.SIGTERM)
-        try:
-            self.child = subprocess.Popen([RELAY], env={**os.environ, "RELAY_PORT": PORT}, start_new_session=True,
-                                          preexec_fn=orphan_too, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                          stderr=subprocess.DEVNULL)
-        except OSError:
-            self.child = None
-
-    def stop(self) -> None:
-        if self.child and self.child.poll() is None:
-            try:
-                os.killpg(self.child.pid, signal.SIGTERM)
-                self.child.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-
-
-def draw(text: str, tags) -> None:
-    """The pane itself, for whoever opens the window: the tile's line, then every model Ollama has on disk."""
-    lines = [text, ""]
-    for model in (tags or {}).get("models") or []:
-        lines.append(f"  {model.get('name', '?'):<34} {gigs(model.get('size') or 0):>7}")
-    lines += ["", f"  http://127.0.0.1:{PORT}/api/ps, read {time.strftime('%H:%M:%S')}; this window closes from the ⌘ menu"]
+def draw(text: str, snap) -> None:
+    lines = [text, "", *body(snap), "", f"  read {time.strftime('%H:%M:%S')}; this window closes from the ⌘ menu"]
     sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
     sys.stdout.flush()
 
 
 def watch() -> int:
-    pane, relay = os.environ.get("TMUX_PANE"), Relay()
+    pane = os.environ.get("TMUX_PANE")
     if not pane:
         sys.exit("local-models: this is the program of a tmux window; run local-models --toggle")
-    atexit.register(relay.stop)
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):  # the window killed, the server going, Ctrl+C
         signal.signal(sig, lambda *_: sys.exit(0))
     shown = status = None
     while True:
-        ps = get("/api/ps")
-        if ps is None:
-            relay.start()  # nobody's relay answers: ours, from now until this window closes
-            time.sleep(min(1, EVERY))
-            ps = get("/api/ps")
-        text = title(ps)
+        snap = read()
+        text = title(snap)
         if text != shown:
             quiet("tmux", "select-pane", "-t", pane, "-T", text)
         if shown is None:  # after the first title: workmux's record keeps the title the pane had when it registered
             quiet(WORKMUX, "register-agent")
-        want = "working" if text not in (UNREACHABLE, NOTHING) else "done"
+        want = "working" if snap is not None and not stale(snap) and loaded(snap) else "done"
         if want != status:
             quiet(WORKMUX, "set-window-status", want)
         shown, status = text, want
-        draw(text, get("/api/tags") if ps is not None else None)
+        draw(text, snap)
         time.sleep(EVERY)
 
 

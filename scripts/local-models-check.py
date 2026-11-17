@@ -3,11 +3,10 @@
 
     python3 ~/.config/tmux/scripts/local-models-check.py
 
-A throwaway tmux server, never the live one. Ollama is a small HTTP server in this process; the
-relay and workmux are stubs that write down that they ran (LOCAL_MODELS_PORT, _RELAY, _WORKMUX).
-No model is loaded, nothing is asked of the real Ollama, and workmux's records are not written.
+A throwaway tmux server, never the live one. fleet.json is a file in a temp dir that the tests
+rewrite (LOCAL_MODELS_FLEET); workmux is a stub that writes down that it ran (LOCAL_MODELS_WORKMUX).
+Nothing on the network is asked, and workmux's records are not written.
 """
-import http.server
 import importlib.util
 import json
 import os
@@ -15,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -29,29 +27,47 @@ _loader = SourceFileLoader("local_models", str(SCRIPT))
 local = importlib.util.module_from_spec(importlib.util.spec_from_loader("local_models", _loader))
 _loader.exec_module(local)
 
-# /api/ps as the Windows Ollama answered on 2026-11-16 08:1x, one model on the CPU; then Ollama's own example,
-# a model wholly on the GPU (docs/api.md, "List Running Models": no context_length in that version).
-ON_CPU = {"name": "cpu-gpt-oss:20b", "size": 14048663960, "size_vram": 0, "context_length": 16384}
-ON_GPU = {"name": "mistral:latest", "size": 5137025024, "size_vram": 5137025024}
-SPLIT = {"name": "local-gpt-oss:20b-64k", "size": 16000000000, "size_vram": 7500000000, "context_length": 65536}
-TAGS = {"models": [{"name": "cpu-gpt-oss:20b", "size": 13800000000}, {"name": "cpu-qwen2.5:3b", "size": 1900000000}]}
+
+def snapshot(at=None, wsl=(), windows=(), ct100=(), runs=(), mlflow_up=True, pi=False):
+    """fleet.json's shape as `fleet --write` wrote it on 2026-11-17 06:33 (~/.local/bin/fleet, snapshot())."""
+    side = lambda found, up=True: {"up": up, "models": list(found)}
+    return {"at": at or time.strftime("%Y-%m-%d %H:%M"), "lucas": "afk", "lucas2": "idle",
+            "lanes": {"working": 3, "done": 6},
+            "local": {"wsl": side(wsl), "windows": side(windows, bool(windows))},
+            "homelab": {"ct100_gpu": side(ct100), "mlflow": {"up": mlflow_up, "running": list(runs)}},
+            "pi": pi}
+
+
+EMBED = {"name": "nomic-embed-text:latest", "gb": 0.3, "gpu_gb": 0.0}
+GPT = {"name": "cpu-gpt-oss:20b", "gb": 13.1, "gpu_gb": 0.0}
+QWEN = {"name": "qwen2.5-coder:14b", "gb": 9.8, "gpu_gb": 9.8}
+NINE = [f"ken_kitchen_{n}" for n in range(9)]
 
 
 class Titles(unittest.TestCase):
-    def test_a_loaded_model_reads_name_ram_gpu_context(self):
-        self.assertEqual(local.title({"models": [ON_CPU]}), "cpu-gpt-oss:20b · 14.0G RAM · 0.0G GPU · 16k")
-        self.assertEqual(local.title({"models": [SPLIT]}), "local-gpt-oss:20b-64k · 8.5G RAM · 7.5G GPU · 64k")
+    def test_what_fleet_saw_on_one_line_local_then_ct100_runs_and_pi(self):
+        self.assertEqual(local.title(snapshot(wsl=[EMBED], runs=NINE)),
+                         "nomic-embed-text 0.3G · ct100 idle · 9 runs · pi not installed")
+        self.assertEqual(local.title(snapshot(wsl=[EMBED], windows=[GPT], ct100=[QWEN], pi=True)),
+                         "nomic-embed-text 0.3G, cpu-gpt-oss:20b 13.1G · ct100 qwen2.5-coder:14b · 0 runs · pi installed")
 
-    def test_ram_is_what_is_not_on_the_gpu_and_a_missing_context_is_left_out(self):
-        self.assertEqual(local.title({"models": [ON_GPU]}), "mistral:latest · 0.0G RAM · 5.1G GPU")
+    def test_nothing_anywhere_and_mlflow_down(self):
+        self.assertEqual(local.title(snapshot(mlflow_up=False)), "local idle · ct100 idle · mlflow down · pi not installed")
 
-    def test_more_than_one_loaded_is_the_first_and_a_count(self):
-        self.assertEqual(local.title({"models": [ON_CPU, ON_GPU, SPLIT]}), "cpu-gpt-oss:20b · 14.0G RAM · 0.0G GPU · 16k +2")
+    def test_no_snapshot_and_a_stale_one(self):
+        self.assertEqual(local.title(None), "fleet: no snapshot")
+        old = snapshot(at="2026-11-17 06:33", wsl=[EMBED])
+        then = time.mktime(time.strptime("2026-11-17 06:33", "%Y-%m-%d %H:%M"))
+        self.assertEqual(local.title(old, now=then + 179), "nomic-embed-text 0.3G · ct100 idle · 0 runs · pi not installed")
+        self.assertEqual(local.title(old, now=then + 181), "fleet: stale since 06:33")
+        self.assertEqual(local.title({"lucas": "afk"}), "fleet: stale since ?")
 
-    def test_nothing_loaded_and_unreachable(self):
-        self.assertEqual(local.title({"models": []}), "ollama: nothing loaded")
-        self.assertEqual(local.title({}), "ollama: nothing loaded")
-        self.assertEqual(local.title(None), "ollama: unreachable")
+    def test_the_body_names_every_surface_and_each_run(self):
+        text = "\n".join(local.body(snapshot(wsl=[EMBED], runs=NINE)))
+        for want in ("WSL Ollama", "nomic-embed-text:latest 0.3G (0.0G GPU)", "Windows Ollama (relay :11435)   down",
+                     "CT 100 Ollama (GPU LXC)         nothing loaded", "9 marked running", "ken_kitchen_8",
+                     "Pi coding agent                 not installed"):
+            self.assertIn(want, text)
 
     def test_the_menu_has_the_toggle_on_l(self):
         lines = [line for line in MENU.read_text().splitlines() if line.startswith("local models ")]
@@ -59,59 +75,26 @@ class Titles(unittest.TestCase):
         self.assertRegex(lines[0], r"^local models +l +tmux: run-shell -b '~/\.config/tmux/scripts/local-models --toggle'$")
 
 
-class Ollama:
-    """A stand-in for Ollama on a free port: /api/ps answers with self.loaded, /api/tags with TAGS; down() stops it."""
-
-    def __init__(self):
-        outer = self
-        self.loaded, self.asked = [], []
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                outer.asked.append(self.path)
-                body = json.dumps({"models": outer.loaded} if self.path == "/api/ps" else TAGS).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_POST(self):  # anything that could load a model
-                outer.asked.append("POST " + self.path)
-                self.send_response(500)
-                self.end_headers()
-
-            def log_message(self, *args):
-                pass
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.port = str(self.server.server_address[1])
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    def down(self):
-        self.server.shutdown()
-        self.server.server_close()
-
-
 class Window(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="local-models-check-"))
         self.sock = str(self.tmp / "tmux.sock")
-        self.ollama = Ollama()
-        self.relay_ran, self.workmux_ran = self.tmp / "relay.pids", self.tmp / "workmux.log"
-        relay = self.tmp / "relay"
-        relay.write_text(f"#!/bin/sh\necho $$ $RELAY_PORT >> {self.relay_ran}\nexec sleep 600\n")
+        self.fleet = self.tmp / "fleet.json"
+        self.workmux_ran = self.tmp / "workmux.log"
         workmux = self.tmp / "workmux"
         workmux.write_text(f'#!/bin/sh\necho "$TMUX_PANE $* [$(tmux display-message -p -t "$TMUX_PANE" "#{{pane_title}}")]" >> {self.workmux_ran}\n')
-        for stub in (relay, workmux):
-            stub.chmod(0o755)
-        self.env = {"LOCAL_MODELS_PORT": self.ollama.port, "LOCAL_MODELS_RELAY": str(relay),
-                    "LOCAL_MODELS_WORKMUX": str(workmux), "LOCAL_MODELS_EVERY": "0.3"}
-        self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "elsewhere", "-n", "view", "-x", "100", "-y", "20", "cat")
+        workmux.chmod(0o755)
+        self.env = {"LOCAL_MODELS_FLEET": str(self.fleet), "LOCAL_MODELS_WORKMUX": str(workmux), "LOCAL_MODELS_EVERY": "0.3"}
+        self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "elsewhere", "-n", "view", "-x", "100", "-y", "30", "cat")
         for name, value in self.env.items():
             self.tmux("set-environment", "-g", name, value)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.addCleanup(self.tmux, "kill-server")
-        self.addCleanup(self.ollama.down)
+
+    def write(self, snap):
+        part = self.fleet.with_suffix(".part")  # as a whole file at once, the way a reader would see a rename
+        part.write_text(json.dumps(snap))
+        part.replace(self.fleet)
 
     def tmux(self, *args):
         env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
@@ -150,58 +133,52 @@ class Window(unittest.TestCase):
     def workmux(self):
         return self.workmux_ran.read_text().splitlines() if self.workmux_ran.exists() else []
 
-    def relays(self):
-        """Pids of the stub relays started so far that are still running."""
-        pids = [line.split()[0] for line in self.relay_ran.read_text().splitlines()] if self.relay_ran.exists() else []
-        return [pid for pid in pids if os.path.exists(f"/proc/{pid}")]
-
-    def test_the_title_follows_what_is_loaded_and_workmux_is_told(self):
-        self.ollama.loaded = [ON_CPU]
+    def test_the_title_follows_fleet_json_and_workmux_is_told(self):
+        self.write(snapshot(wsl=[EMBED], runs=NINE))
         self.toggle()
-        loaded = "cpu-gpt-oss:20b · 14.0G RAM · 0.0G GPU · 16k"
+        loaded = "nomic-embed-text 0.3G · ct100 idle · 9 runs · pi not installed"
         self.wait_title(loaded)
         pane = self.of("#{pane_id}")
         self.wait(lambda: len(self.workmux()) >= 2, self.workmux)
         self.assertEqual(self.workmux()[:2], [f"{pane} register-agent [{loaded}]",  # registered with its title set:
                                               f"{pane} set-window-status working [{loaded}]"])  # workmux records that one
-        self.ollama.loaded = []
-        self.wait_title("ollama: nothing loaded")
-        self.wait(lambda: self.workmux()[-1] == f"{pane} set-window-status done [ollama: nothing loaded]", self.workmux)
-        self.ollama.loaded = [SPLIT, ON_GPU]
-        self.wait_title("local-gpt-oss:20b-64k · 8.5G RAM · 7.5G GPU · 64k +1")
+        self.write(snapshot(runs=NINE))  # runs marked RUNNING alone are not "working": a crashed one stays marked
+        self.wait_title("local idle · ct100 idle · 9 runs · pi not installed")
+        self.wait(lambda: self.workmux()[-1].startswith(f"{pane} set-window-status done ["), self.workmux)
+        self.write(snapshot(ct100=[QWEN]))
+        self.wait_title("local idle · ct100 qwen2.5-coder:14b · 0 runs · pi not installed")
         self.wait(lambda: self.workmux()[-1].startswith(f"{pane} set-window-status working ["), self.workmux)
-        self.ollama.loaded = [ON_CPU]  # another model, the same status: the title moves, workmux is not called
-        self.wait_title(loaded)
-        time.sleep(1.5)
+        self.write(snapshot(wsl=[EMBED]))  # another model, the same status: the title moves, workmux is not called
+        self.wait_title("nomic-embed-text 0.3G · ct100 idle · 0 runs · pi not installed")
+        time.sleep(1)
         self.assertEqual(len(self.workmux()), 4)
-        self.assertEqual(set(self.ollama.asked), {"/api/ps", "/api/tags"})  # reads only: nothing that loads a model
-        self.assertIn("cpu-qwen2.5:3b", self.tmux("capture-pane", "-p", "-t", self.window()))  # the body lists the tags
-        self.assertEqual(self.relays(), [])  # Ollama answered all along: no relay of ours
+        shown = self.tmux("capture-pane", "-p", "-t", self.window())
+        self.assertIn("CT 100 Ollama (GPU LXC)", shown)
+        self.assertIn("Pi coding agent                 not installed", shown)
 
-    def test_unreachable_starts_the_relay_and_closing_the_window_stops_it_and_the_poller(self):
-        self.ollama.down()
+    def test_a_missing_then_stale_snapshot_says_so_and_is_done(self):
         self.toggle()
-        self.wait_title("ollama: unreachable")
-        self.wait(lambda: len(self.relays()) == 1, lambda: f"relays {self.relays()}")
-        self.assertEqual(self.relay_ran.read_text().split()[1], self.ollama.port)  # on the port it reads
-        time.sleep(1.5)
-        self.assertEqual(len(self.relay_ran.read_text().splitlines()), 1)  # one relay, not one per poll
-        poller = self.of("#{pane_pid}")
-        self.toggle()
-        self.wait(lambda: not any(w.endswith(":local-models") for w in self.windows()), self.windows)
-        self.wait(lambda: self.relays() == [] and not os.path.exists(f"/proc/{poller}"),
-                  lambda: f"left: relays {self.relays()}, poller alive {os.path.exists(f'/proc/{poller}')}")
+        self.wait_title("fleet: no snapshot")
+        self.write(snapshot(at="2026-11-17 06:33", wsl=[EMBED]))
+        self.wait_title("fleet: stale since 06:33")
+        self.wait(lambda: self.workmux() and self.workmux()[-1].split()[1:3] == ["set-window-status", "done"], self.workmux)
+        self.assertNotIn("working", " ".join(self.workmux()))
 
-    def test_a_poller_killed_outright_takes_its_relay_with_it(self):
-        self.ollama.down()
+    def test_it_asks_nothing_on_the_network(self):
+        """No Ollama, relay or MLflow call from the tile: fleet does those. Every connect() refused, the title still comes."""
+        guard = self.tmp / "sitecustomize.py"
+        guard.write_text("import socket\ndef _no(*a, **k): raise SystemExit('local-models connected to the network')\n"
+                         "socket.socket.connect = _no\nsocket.create_connection = _no\n")
+        self.env["PYTHONPATH"] = str(self.tmp)
+        self.tmux("set-environment", "-g", "PYTHONPATH", str(self.tmp))
+        self.write(snapshot(wsl=[EMBED]))
         self.toggle()
-        self.wait(lambda: len(self.relays()) == 1, lambda: f"relays {self.relays()}")
-        poller = self.of("#{pane_pid}")
-        os.kill(int(poller), 9)
-        self.wait(lambda: self.relays() == [], lambda: f"relays {self.relays()}")
+        self.wait_title("nomic-embed-text 0.3G · ct100 idle · 0 runs · pi not installed")
+        time.sleep(1)
+        self.assertEqual(self.of("#{pane_current_command}").startswith("python"), True)  # still polling, not exited
 
     def test_the_toggle_opens_it_in_main_behind_the_view_and_closes_it_again(self):
-        self.ollama.loaded = [ON_CPU]
+        self.write(snapshot(wsl=[EMBED]))
         self.tmux("new-session", "-d", "-s", "main", "-n", "coord", "cat")
         view = lambda: self.tmux("list-windows", "-a", "-F", "#{session_name}:#{window_name} #{window_active}")
         before = view()
@@ -210,26 +187,11 @@ class Window(unittest.TestCase):
         self.assertEqual([row for row in view().split("\n") if "local-models" not in row], before.split("\n"))
         self.assertIn("main:local-models 0", view())  # not the window in view
         self.assertEqual(self.of("#{pane_current_path}"), str(Path.home()))
-        self.toggle()
-        self.wait(lambda: not any(w.endswith(":local-models") for w in self.windows()), self.windows)
-        self.assertEqual(view(), before)
-
-    def test_a_relay_it_did_not_start_is_still_running_after_the_window_closes(self):
-        """Someone else's relay is doing the work (the stub Ollama answers): used, never stopped."""
-        theirs = self.tmp / "ollama-relay"
-        theirs.write_text("#!/bin/sh\nexec sleep 600\n")
-        theirs.chmod(0o755)
-        other = subprocess.Popen([str(theirs)], start_new_session=True)
-        self.addCleanup(other.kill)
-        self.ollama.loaded = [ON_CPU]
-        self.toggle()
-        self.wait_title("cpu-gpt-oss:20b · 14.0G RAM · 0.0G GPU · 16k")
         poller = self.of("#{pane_pid}")
         self.toggle()
+        self.wait(lambda: not any(w.endswith(":local-models") for w in self.windows()), self.windows)
         self.wait(lambda: not os.path.exists(f"/proc/{poller}"), lambda: "the poller is still running")
-        time.sleep(0.5)
-        self.assertIsNone(other.poll())  # theirs: still running
-        self.assertEqual(self.relays(), [])  # and none of ours was ever started
+        self.assertEqual(view(), before)
 
     def test_with_no_session_called_main_it_opens_where_the_toggle_ran(self):
         self.toggle()

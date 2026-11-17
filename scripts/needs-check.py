@@ -180,6 +180,30 @@ class Badge(unittest.TestCase):
         self.click("! 1", self.badge())
         self.wait_for("a decision only Lucas makes")
 
+    def test_an_ask_with_a_file_opens_it_read_only_in_a_popup(self):
+        note = Path(self.dir.name) / "decide.md"
+        note.write_text("pick-one-of-these-three\n")
+        self.needs("add", "read the note", "--where", str(note))
+        self.wait_for("! 1 ")
+        self.click("! 1", self.badge())
+        self.wait_for("read the note")
+        self.click("read the note")
+        self.wait_for("pick-one-of-these-three", seconds=30)  # nvim with Lucas's config, in the popup
+        self.assertEqual(note.read_text(), "pick-one-of-these-three\n")
+        self.keys(":q", "Enter")
+        self.wait_for("pick-one-of-these-three", gone=True, seconds=10)
+
+    def test_an_ask_with_nowhere_shows_its_text(self):
+        self.needs("add", "say yes or no to the plan")
+        self.wait_for("! 1 ")
+        self.click("! 1", self.badge())
+        self.wait_for("say yes or no to the plan")
+        self.click("say yes or no to the plan")
+        self.wait_for("say yes or no to the plan")  # now the message on the status line, not the menu
+        self.assertNotIn("waiting on you", "\n".join(self.screen()))  # the menu closed
+        # -N -d 8000: keys do not clear it, so wait it out, or it covers the next pin's status line
+        self.wait_for("say yes or no to the plan", gone=True, seconds=12)
+
     def test_the_status_job_keeps_n_without_anyone_running_needs(self):
         """No --write from the test: status-left's #() job (scripts/needs-job) does it."""
         self.dialog()

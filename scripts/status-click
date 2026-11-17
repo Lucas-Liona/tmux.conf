@@ -132,7 +132,8 @@ def do(client: str, pane: str, number: str, shown: str) -> None:
             if mark(label, body) != shown:
                 break
             return popup(client, pane, label, body)
-    tmux("display-message", "-c", client, f"click menu: line {number} changed since the menu opened; nothing run")
+    # -N -d: the click's own button release is a key, and a key clears a message; a fast refusal was gone unseen
+    tmux("display-message", "-N", "-d", "4000", "-c", client, f"click menu: line {number} changed since the menu opened; nothing run")
 
 
 def bind() -> None:

@@ -1,0 +1,13 @@
+#!/bin/sh
+# status-left's #() job for the ! badge: runs `needs --write` (it sets @needs_count) at most once
+# every EVERY seconds for the whole server, in the background with its output closed, so the job
+# ends at once and never holds the bar. The gate is window-models-job's, for the same reason: tmux
+# starts a #() job on any redraw in a new second, once per client, and Python each time costs more.
+EVERY=5
+stamp="${TMUX%%,*}.needs"
+now=$(date +%s)
+last=0
+[ -r "$stamp" ] && read -r last < "$stamp"
+[ $((now - ${last:-0})) -lt "$EVERY" ] && exit 0
+echo "$now" > "$stamp"
+"${NEEDS:-needs}" --write > /dev/null 2>&1 &

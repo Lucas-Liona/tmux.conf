@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""The ! badge's click: a menu of what waits on Lucas, from `needs --json`; an item goes where it lives.
+
+    needs-menu <client> <file>          write the menu as a tmux command to <file> (the click binding sources it)
+    needs-menu --go <client> <where>    an item: a pane (%12 or session:window.pane) is switched to, a file
+                                        opens read-only in a popup, anything else is shown as a message
+
+Written to a file and sourced by the binding, as the ⌘ menu is: a menu a background job opens gets no
+mouse (scripts/status-click). The data is the needs command's; this only draws it.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+ME = Path(__file__).resolve()
+NEEDS = os.environ.get("NEEDS", "needs")
+NVIM = "/opt/nvim-linux64/bin/nvim"  # not on the tmux server's PATH
+
+
+def tmux(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def quote(arg: str) -> str:
+    """One argument in tmux's config syntax: single quotes, nothing inside them is special."""
+    return "'" + arg.replace("'", "'\\''") + "'"
+
+
+def go_call(client: str, where: str) -> str:
+    return "run-shell -b " + quote(shlex.join([str(ME), "--go", client, where]))
+
+
+def menu(client: str, out: Path) -> None:
+    try:
+        snap = json.loads(subprocess.run([NEEDS, "--json"], capture_output=True, text=True, timeout=10).stdout)
+        args = []
+        for n, item in enumerate(snap.get("items", []), 1):
+            label = item["text"] + (f"  ({item['where']})" if item.get("where") else "")
+            args += [label[:70].replace("#", "##"), str(n) if n < 10 else "",
+                     go_call(client, item.get("pane") or item.get("where") or item["text"])]
+        if not args:
+            args = ["-nothing waits on you", "", ""]
+    except Exception as error:  # a click that draws nothing reads as a dead button
+        args = ["-" + f"needs failed: {type(error).__name__}: {error}"[:60].replace("#", "##"), "", ""]
+    # --: a greyed first item starts with "-" and would be read as a flag
+    command = ["display-menu", "-O", "-c", client, "-x", "M", "-y", "M", "-T", "#[align=centre] ! waiting on you ", "--", *args]
+    out.write_text(" ".join(map(quote, command)) + "\n")
+
+
+def go(client: str, where: str) -> None:
+    panes = tmux("list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_index}.#{pane_index}").stdout.split()
+    if where in panes:
+        tmux("switch-client", "-c", client, "-t", where)
+        tmux("select-window", "-t", where)
+        tmux("select-pane", "-t", where)
+    elif Path(os.path.expanduser(where)).is_file():
+        tmux("display-popup", "-c", client, "-E", "-w", "90%", "-h", "85%", f"{NVIM} -R {shlex.quote(os.path.expanduser(where))}")
+    else:
+        tmux("display-message", "-N", "-d", "8000", "-c", client, where)  # -N: the click's release would clear it
+
+
+def main(argv: list[str]) -> int:
+    match argv:
+        case ["--go", client, where]:
+            go(client, where)
+        case [client, out] if not client.startswith("-"):
+            menu(client, Path(out))
+        case _:
+            print(__doc__.split("\n\n")[1], file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

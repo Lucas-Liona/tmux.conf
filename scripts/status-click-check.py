@@ -71,6 +71,20 @@ class Parse(unittest.TestCase):
         self.assertEqual(shipped["skills in this pane"], bound["B"])
 
 
+class Files(unittest.TestCase):
+    def test_two_clients_get_two_files_and_a_gone_clients_file_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "default.click-menu"
+            gone = Path(f"{base}-999999999")  # no such pid
+            gone.write_text("old\n")
+            mine, theirs = Path(f"{base}-{os.getpid()}"), Path(f"{base}-{os.getppid()}")
+            status_click.menu("/dev/pts/1", "%1", mine)
+            status_click.menu("/dev/pts/2", "%2", theirs)
+            self.assertIn("--do /dev/pts/1 %1 ", mine.read_text())
+            self.assertIn("--do /dev/pts/2 %2 ", theirs.read_text())
+            self.assertFalse(gone.exists())
+
+
 class Click(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -176,6 +190,28 @@ class Click(unittest.TestCase):
         self.wait_for(f"popup-says-{self.pane}-in-{self.work}-menu-{self.menu}", seconds=15)  # zsh -i takes a moment
         self.keys("x")  # read -k 1 returns, the code ends, the popup closes
         self.wait_for("popup-says", gone=True)
+
+    def test_a_bad_first_line_still_opens_the_menu(self):
+        """Its greyed label starts with "-", which display-menu read as a flag before the "--"."""
+        self.menu.write_text("this line has no action\n" + MENU)
+        self.click("⌘ menu")
+        self.wait_for("line 1: this line has no action")
+        self.wait_for("say hi")
+
+    def test_the_menu_is_written_for_this_client_alone(self):
+        """Red team 2026-11-17 #14: one file per server let two clients' clicks overwrite each other's menu."""
+        pid = self.tmux(self.inner, "list-clients", "-F", "#{client_pid}")
+        self.click("⌘ menu")
+        self.wait_for("say hi")
+        mine = Path(f"{self.inner}.click-menu-{pid}")
+        self.assertTrue(mine.exists())
+        self.assertFalse(Path(f"{self.inner}.click-menu").exists())
+
+    def test_a_menu_that_cannot_be_built_says_why_instead_of_a_dead_click(self):
+        self.menu.write_bytes(b"say hi  sh: true \xff\n")  # not UTF-8: reading it raises
+        self.click("⌘ menu")
+        self.wait_for("click menu failed: UnicodeDecodeError")
+        self.wait_for("edit this menu")
 
     def test_an_sh_line_edited_while_the_menu_is_open_is_refused_not_run(self):
         """Red team 2026-11-17 #14: the click ran whatever sat on the line number by then."""

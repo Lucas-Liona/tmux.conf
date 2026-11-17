@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The ⌘ on the status bar: a click opens a menu read from a plain file, so the file is the program.
 
-    status-click <client> <pane>            write the menu as a tmux command (tmux.conf: a left click on the ⌘)
+    status-click <client> <pane> <file>     write the menu as a tmux command to <file>, one per client
+                                            (tmux.conf: a left click on the ⌘)
     status-click --do <client> <pane> <n> <hash>
                                             run line n of the file in a popup (what an sh: item calls),
                                             only if it is still the item the menu showed
@@ -13,7 +14,7 @@ Its header says how a line is written. A line that does not parse is drawn greye
 line number, and the rest of the menu still works.
 
 The click binding draws the menu itself, by sourcing what this script wrote beside the server's
-socket. A menu that a background script opens was not opened by the mouse, so tmux gives it no
+socket, in a file named for the client: two clients clicking at once each get their own menu. A menu that a background script opens was not opened by the mouse, so tmux gives it no
 mouse: the click's own release closed it, and no item could be clicked.
 """
 import hashlib
@@ -84,7 +85,24 @@ def quote(arg: str) -> str:
     return "'" + arg.replace("'", "'\\''") + "'"
 
 
-def menu(client: str, pane: str) -> None:
+def menu(client: str, pane: str, out: Path) -> None:
+    """The menu as a tmux command in `out`. If building it fails, a menu that says why, and the way to the file."""
+    try:
+        args = entries(client, pane)
+    except Exception as error:  # a click that draws nothing reads as a dead button
+        args = ["-" + f"click menu failed: {type(error).__name__}: {error}"[:60].replace("#", "##"), "", "",
+                "edit this menu", "e", call("--edit", client, pane)]
+    # -O: the menu stays up after the click that opened it. R, S: right edge, the line above the bar,
+    # clear of the pointer, so the button coming up never lands on an item. --: a greyed first item starts
+    # with "-" and would be read as a flag ("-click …" is -c, a client), and the menu would not open.
+    command = ["display-menu", "-O", "-t", pane, "-x", "R", "-y", "S", "-T", "#[align=centre] ⌘ ", "--", *args]
+    out.write_text(" ".join(map(quote, command)) + "\n")
+    for old in out.parent.glob(out.name.rpartition("-")[0] + "-*"):  # files of clients that are gone
+        if old != out and not Path("/proc", old.name.rpartition("-")[2]).exists():
+            old.unlink(missing_ok=True)
+
+
+def entries(client: str, pane: str) -> list[str]:
     args, usable = [], False
     for n, label, key, kind, body in read_items():
         if kind == "":
@@ -96,10 +114,7 @@ def menu(client: str, pane: str) -> None:
             usable = True
     if not usable:  # an empty, missing or broken file: still a way in
         args += ["edit this menu", "e", call("--edit", client, pane)]
-    # -O: the menu stays up after the click that opened it. R, S: right edge, the line above the bar,
-    # clear of the pointer, so the button coming up never lands on an item.
-    command = ["display-menu", "-O", "-t", pane, "-x", "R", "-y", "S", "-T", "#[align=centre] ⌘ ", *args]
-    Path(os.environ["TMUX"].split(",")[0] + ".click-menu").write_text(" ".join(map(quote, command)) + "\n")
+    return args
 
 
 def popup(client: str, pane: str, title: str, code: str) -> None:
@@ -140,9 +155,9 @@ def main(args: list[str]) -> int:
             popup(client, pane, "click-menu.conf", "${EDITOR:-nvim} $STATUS_MENU")
         case ["--bind"]:
             bind()
-        case [client, pane] if not client.startswith("-"):
-            try:  # run-shell shows what a job prints over the pane: say nothing, whatever happens
-                menu(client, pane)
+        case [client, pane, out] if not client.startswith("-"):
+            try:  # run-shell shows what a job prints over the pane; menu() puts its own failure in the menu
+                menu(client, pane, Path(out))
             except Exception:
                 pass
         case _:

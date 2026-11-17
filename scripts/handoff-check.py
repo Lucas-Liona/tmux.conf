@@ -161,7 +161,8 @@ class Server:
                              env={**self.stubs(), "HANDOFF_OUT": str(self.dir / "out"), **env}, timeout=30)
         if run.returncode:
             raise AssertionError(f"handoff.py (the press) exited {run.returncode}: {run.stdout}{run.stderr}")
-        return next((self.dir / "out").glob("*.launch.md"))
+        # each press leaves its own buffer; the newest is this one (glob order is the directory's, not time)
+        return max((self.dir / "out").glob("*.launch.md"), key=lambda f: f.stat().st_mtime_ns)
 
     def tmux(self, *args):
         return subprocess.run(["tmux", "-S", self.sock, *args], capture_output=True, text=True).stdout.strip()

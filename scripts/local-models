@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""The local-models window: what fleet saw on every model surface, as a tile in the workmux sidebar.
+
+    local-models             the window's program: read fleet.json, register with workmux, keep the title current
+    local-models --toggle    the ⌘ menu's line: open that window in session main, or close it
+
+A sidebar tile is a pane workmux knows as an agent, and its text is the pane's title. So this
+registers its own pane the way Claude's hooks do (workmux register-agent, then set-window-status)
+and sets the title every few seconds from ~/.cache/panel/fleet.json, which `fleet --write` rewrites
+each minute (fleet.timer). This asks nothing of Ollama, CT 100 or MLflow itself: fleet does, once,
+for every surface (tmux bar, sidebar, Zebar).
+
+    nomic-embed-text 0.3G · ct100 idle · 9 runs · pi not installed
+    fleet: no snapshot                     the file is missing or unreadable
+    fleet: stale since 06:33               fleet.timer has not rewritten it for STALE seconds
+
+"runs" are MLflow runs marked RUNNING; a crashed run stays marked, so they do not make the tile
+"working". A loaded model anywhere does.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ME = Path(__file__).resolve()
+WINDOW = "local-models"
+FLEET = Path(os.environ.get("LOCAL_MODELS_FLEET", str(Path.home() / ".cache/panel/fleet.json")))  # overrides: for checking
+WORKMUX = os.environ.get("LOCAL_MODELS_WORKMUX", "workmux")
+EVERY = float(os.environ.get("LOCAL_MODELS_EVERY", "5"))
+STALE = 180  # fleet.timer runs each minute: three missed runs
+MISSING = "fleet: no snapshot"
+SURFACES = (("wsl", "WSL Ollama", "local"), ("windows", "Windows Ollama (relay :11435)", "local"),
+            ("ct100_gpu", "CT 100 Ollama (GPU LXC)", "homelab"))
+
+
+def read():
+    """fleet.json as a dict, or None when it is missing or not JSON."""
+    try:
+        snap = json.loads(FLEET.read_text())
+    except (OSError, ValueError):
+        return None
+    return snap if isinstance(snap, dict) else None
+
+
+def stale(snap, now=None):
+    """The snapshot's "at" (HH:MM) when it is older than STALE, else None. An unreadable time is stale."""
+    try:
+        at = datetime.strptime(snap["at"], "%Y-%m-%d %H:%M")
+    except (KeyError, TypeError, ValueError):
+        return "?"
+    return at.strftime("%H:%M") if (now or time.time()) - at.timestamp() > STALE else None
+
+
+def models(snap, side, group):
+    return ((snap.get(group) or {}).get(side) or {}).get("models") or []
+
+
+def short(name: str) -> str:
+    return name[:-len(":latest")] if name.endswith(":latest") else name
+
+
+def loaded(snap) -> bool:
+    return any(models(snap, side, group) for side, _, group in SURFACES)
+
+
+def title(snap, now=None) -> str:
+    """The tile's text: local models, CT 100, MLflow runs, Pi. The sidebar shows its first ~14 characters."""
+    if snap is None:
+        return MISSING
+    old = stale(snap, now)
+    if old:
+        return f"fleet: stale since {old}"
+    local = [f"{short(m.get('name') or '?')} {m.get('gb', 0)}G" for side in ("wsl", "windows")
+             for m in models(snap, side, "local")]
+    lab = [short(m.get("name") or "?") for m in models(snap, "ct100_gpu", "homelab")]
+    mlflow = (snap.get("homelab") or {}).get("mlflow") or {}
+    runs = f"{len(mlflow.get('running') or [])} runs" if mlflow.get("up") else "mlflow down"
+    pi = "pi installed" if snap.get("pi") else "pi not installed"
+    return " · ".join([", ".join(local) or "local idle", f"ct100 {', '.join(lab) or 'idle'}", runs, pi])
+
+
+def body(snap) -> list[str]:
+    """The window itself, for whoever opens it: each surface on its own line."""
+    if snap is None:
+        return [f"  {FLEET} is missing: is fleet.timer running? (systemctl --user status fleet.timer)"]
+    lines = [f"  fleet.json written {snap.get('at', '?')}", ""]
+    for side, label, group in SURFACES:
+        up = ((snap.get(group) or {}).get(side) or {}).get("up")
+        found = models(snap, side, group)
+        what = "down" if not up else ", ".join(f"{m.get('name')} {m.get('gb', 0)}G ({m.get('gpu_gb', 0)}G GPU)"
+                                              for m in found) or "nothing loaded"
+        lines.append(f"  {label:<31} {what}")
+    mlflow = (snap.get("homelab") or {}).get("mlflow") or {}
+    running = mlflow.get("running") or []
+    lines.append(f"  {'MLflow (CT 118 sf-train runs)':<31} "
+                 + (f"{len(running)} marked running (a crashed run stays marked)" if mlflow.get("up") else "down"))
+    lines += [f"    {run}" for run in running]
+    lines.append(f"  {'Pi coding agent':<31} {'installed' if snap.get('pi') else 'not installed'}")
+    return lines
+
+
+def quiet(*argv: str) -> None:
+    """Run and forget. stdin is closed: workmux reads a hook's input there and would wait for it."""
+    try:
+        subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def draw(text: str, snap) -> None:
+    lines = [text, "", *body(snap), "", f"  read {time.strftime('%H:%M:%S')}; this window closes from the ⌘ menu"]
+    sys.stdout.write("\033[2J\033[H" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def watch() -> int:
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        sys.exit("local-models: this is the program of a tmux window; run local-models --toggle")
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):  # the window killed, the server going, Ctrl+C
+        signal.signal(sig, lambda *_: sys.exit(0))
+    shown = status = None
+    while True:
+        snap = read()
+        text = title(snap)
+        if text != shown:
+            quiet("tmux", "select-pane", "-t", pane, "-T", text)
+        if shown is None:  # after the first title: workmux's record keeps the title the pane had when it registered
+            quiet(WORKMUX, "register-agent")
+        want = "working" if snap is not None and not stale(snap) and loaded(snap) else "done"
+        if want != status:
+            quiet(WORKMUX, "set-window-status", want)
+        shown, status = text, want
+        draw(text, snap)
+        time.sleep(EVERY)
+
+
+def toggle() -> int:
+    """Close every local-models window, or open one behind the window in view: in main, else this session."""
+    tmux = lambda *args: subprocess.run(["tmux", *args], capture_output=True, text=True).stdout.strip()
+    rows = [row.split("\t") for row in tmux("list-windows", "-a", "-F", "#{window_id}\t#{window_name}\t#{session_name}").splitlines()]
+    open_ones = [window for window, name, _ in rows if name == WINDOW]
+    for window in open_ones:
+        tmux("kill-window", "-t", window)
+    if not open_ones:
+        where = ["-t", "main:"] if any(session == "main" for _, _, session in rows) else []
+        tmux("new-window", "-d", *where, "-n", WINDOW, "-c", str(Path.home()), str(ME))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(toggle() if sys.argv[1:] == ["--toggle"] else watch())

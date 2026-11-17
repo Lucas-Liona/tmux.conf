@@ -2,7 +2,9 @@
 """The ⌘ on the status bar: a click opens a menu read from a plain file, so the file is the program.
 
     status-click <client> <pane>            write the menu as a tmux command (tmux.conf: a left click on the ⌘)
-    status-click --do <client> <pane> <n>   run line n of the file in a popup (what an sh: item calls)
+    status-click --do <client> <pane> <n> <hash>
+                                            run line n of the file in a popup (what an sh: item calls),
+                                            only if it is still the item the menu showed
     status-click --edit <client> <pane>     the file in an editor popup (a right click on the ⌘)
     status-click --bind                     tmux.conf, once: put --edit on the right click
 
@@ -14,6 +16,7 @@ The click binding draws the menu itself, by sourcing what this script wrote besi
 socket. A menu that a background script opens was not opened by the mouse, so tmux gives it no
 mouse: the click's own release closed it, and no item could be clicked.
 """
+import hashlib
 import os
 import re
 import shlex
@@ -66,6 +69,11 @@ def read_items() -> list[tuple]:
         return []
 
 
+def mark(label: str, body: str) -> str:
+    """What the menu showed for an item, short: --do refuses a line whose label or code is no longer this."""
+    return hashlib.sha256(f"{label}\0{body}".encode()).hexdigest()[:12]
+
+
 def call(*argv: str, formats: str = "") -> str:
     """A tmux command that runs this script: argv quoted for run-shell's sh, `formats` left for tmux to fill."""
     return "run-shell -b '" + f"{shlex.join([str(ME), *argv])} {formats}".strip().replace("'", "'\\''") + "'"
@@ -84,7 +92,7 @@ def menu(client: str, pane: str) -> None:
         elif kind is None:
             args += ["-" + f"line {n}: {label}"[:50].replace("#", "##"), "", ""]
         else:  # a tmux: body goes in as it is, and display-menu expands its formats for this client and pane
-            args += [label, key, body if kind == "tmux:" else call("--do", client, pane, str(n))]
+            args += [label, key, body if kind == "tmux:" else call("--do", client, pane, str(n), mark(label, body))]
             usable = True
     if not usable:  # an empty, missing or broken file: still a way in
         args += ["edit this menu", "e", call("--edit", client, pane)]
@@ -101,11 +109,15 @@ def popup(client: str, pane: str, title: str, code: str) -> None:
          "-e", f"STATUS_PANE={pane}", "-e", f"STATUS_CLIENT={client}", "-e", f"STATUS_MENU={MENU}", "zsh", "-ic", code)
 
 
-def do(client: str, pane: str, number: str) -> None:
+def do(client: str, pane: str, number: str, shown: str) -> None:
+    """Line `number`, if it is still what the menu showed: the file is read again at the click, and an edit
+    while the menu was open would otherwise run whatever sits on that line now."""
     for n, label, _, kind, body in read_items():
         if str(n) == number and kind == "sh:":
+            if mark(label, body) != shown:
+                break
             return popup(client, pane, label, body)
-    tmux("display-message", "-c", client, f"click menu: line {number} is not an sh: item any more")
+    tmux("display-message", "-c", client, f"click menu: line {number} changed since the menu opened; nothing run")
 
 
 def bind() -> None:
@@ -122,8 +134,8 @@ def bind() -> None:
 
 def main(args: list[str]) -> int:
     match args:
-        case ["--do", client, pane, number]:
-            do(client, pane, number)
+        case ["--do", client, pane, number, shown]:
+            do(client, pane, number, shown)
         case ["--edit", client, pane]:
             popup(client, pane, "click-menu.conf", "${EDITOR:-nvim} $STATUS_MENU")
         case ["--bind"]:

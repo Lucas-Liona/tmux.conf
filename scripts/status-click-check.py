@@ -177,6 +177,19 @@ class Click(unittest.TestCase):
         self.keys("x")  # read -k 1 returns, the code ends, the popup closes
         self.wait_for("popup-says", gone=True)
 
+    def test_an_sh_line_edited_while_the_menu_is_open_is_refused_not_run(self):
+        """Red team 2026-11-17 #14: the click ran whatever sat on the line number by then."""
+        self.click("⌘ menu")
+        self.wait_for("say hi")
+        text = self.menu.read_text()
+        self.assertIn("say hi      h  sh: print popup-says", text)
+        self.menu.write_text(text.replace("sh: print popup-says", "sh: print swapped-in; read -k 1 #"))
+        self.click("say hi")
+        self.wait_for("changed since the menu opened")
+        time.sleep(1)
+        self.assertNotIn("swapped-in", self.screen())
+        self.assertNotIn("popup-says", self.screen())
+
     def test_a_tmux_item_runs_with_the_clicked_panes_formats_by_key_or_by_mouse(self):
         self.click("⌘ menu")
         self.wait_for("rename")

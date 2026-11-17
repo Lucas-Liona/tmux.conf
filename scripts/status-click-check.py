@@ -187,7 +187,7 @@ class Click(unittest.TestCase):
         self.click("⌘ menu")
         self.wait_for("say hi")
         self.click("say hi")
-        self.wait_for(f"popup-says-{self.pane}-in-{self.work}-menu-{self.menu}", seconds=15)  # zsh -i takes a moment
+        self.wait_for(f"popup-says-{self.pane}-in-{self.work}-menu-{self.menu}", seconds=45)  # zsh -i: up to 11 s under load
         self.keys("x")  # read -k 1 returns, the code ends, the popup closes
         self.wait_for("popup-says", gone=True)
 

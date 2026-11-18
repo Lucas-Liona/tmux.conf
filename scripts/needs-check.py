@@ -22,7 +22,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 CONF = HERE.parent / "tmux.conf"
 NEEDS = os.environ.get("NEEDS_BIN", str(Path.home() / ".local/bin/needs"))
-LINES = re.compile(r"^(set -g (mouse|pane-border-format|status-left) |bind -n MouseDown1Status )")
+LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status-left) |bind -n MouseDown1Status )")
 LEFT, MOVE = 0, 35
 # What Claude Code's trust dialog leaves at the bottom of a pane (live, main:3.2, 2026-11-17 08:4x)
 TRUST = ["Quick safety check: Is this a project you created or one you trust?", "❯ No, exit",
@@ -65,7 +65,7 @@ class Badge(unittest.TestCase):
                    "NEEDS_OPEN": str(tmp / "open"), "NEEDS_CLIP": str(tmp / "clip"), "NEEDS_VAULT": str(cls.vault)}
         lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
                  for line in CONF.read_text().splitlines() if LINES.match(line)]
-        assert len(lines) == 4, lines
+        assert len(lines) == 5, lines
         conf = tmp / "badge.conf"
         conf.write_text("\n".join(lines + ['set -g @thm_red "#ed8796"', 'set -g @thm_crust "#181926"',
                                            "set -s escape-time 20", "set -g status-interval 1"]) + "\n")
@@ -155,8 +155,7 @@ class Badge(unittest.TestCase):
         self.assertEqual(self.count(), 1)
         item = json.loads(self.needs("--json").stdout)["items"][0]
         self.assertEqual((item["kind"], item["pane"], item["where"]), ("trust", pane, "elsewhere:0.0"))
-        self.wait_for("! 1 ")  # status left, and the border line now on
-        self.assertEqual(self.tmux(self.inner, "show-options", "-gqv", "pane-border-status"), "top")
+        self.wait_for("! 1 ")  # status left, and the border line
         self.click("! 1", self.badge())
         self.wait_for("trust dialog in asker")
         self.click("trust dialog in asker")
@@ -191,7 +190,7 @@ class Badge(unittest.TestCase):
         self.assertEqual(self.needs("done", "1").returncode, 1)  # not open any more
         self.needs("done", "2")
         self.assertEqual(self.count(), 0)
-        self.assertEqual(self.tmux(self.inner, "show-options", "-gv", "pane-border-status"), "off")  # the row given back
+        self.assertNotIn("! ", self.screen()[0])  # the border keeps its row (gen is on it) but loses the badge
         self.assertEqual(self.needs().stdout.strip(), "nothing waits on you")
 
     def test_the_badge_is_on_the_border_line_and_the_status_badge_opens_the_list(self):

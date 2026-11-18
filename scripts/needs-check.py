@@ -34,6 +34,19 @@ def printing(lines, then=()):
     return "printf '%s\\n' " + " ".join("'" + line.replace("'", "'\\''") + "'" for line in [*lines, *then]) + "; exec sleep 600"
 
 
+class Writers(unittest.TestCase):
+    def test_two_writers_at_once_never_crash(self):
+        """The bar's job and an agent's needs add both write the cache. With one shared .part file, the
+        second rename found it already moved: 2 FileNotFoundError in 120 writes (2026-11-18)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "NEEDS_FILE": f"{tmp}/n.jsonl", "NEEDS_CACHE": f"{tmp}/n.json", "TMUX": f"{tmp}/none,0,0"}
+            loop = f"for i in $(seq 60); do {NEEDS} --write; done"
+            writers = [subprocess.Popen(["sh", "-c", loop], env=env, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+            errors = "".join(w.communicate()[1] for w in writers)
+            self.assertNotIn("Traceback", errors)
+            self.assertEqual(sorted(os.listdir(tmp)), ["n.json"])  # no temp file left behind
+
+
 class Badge(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -200,7 +213,22 @@ class Badge(unittest.TestCase):
         return path.read_text() if path.exists() else ""
 
     def nvims(self):
-        return set(subprocess.run(["pgrep", "-x", "nvim"], capture_output=True, text=True).stdout.split())
+        """nvim processes under the throwaway server: one Lucas or an agent starts elsewhere must not fail a pin."""
+        parent = {}
+        for proc in Path("/proc").iterdir():
+            try:
+                fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+                parent[proc.name] = (fields[1], (proc / "comm").read_text().strip())
+            except (OSError, IndexError):
+                continue
+        server = self.tmux(self.inner, "display-message", "-p", "#{pid}")
+        def under(pid):
+            while pid in parent and pid != "1":
+                pid = parent[pid][0]
+                if pid == server:
+                    return True
+            return False
+        return {pid for pid, (_, comm) in parent.items() if comm == "nvim" and under(pid)}
 
     def test_tiers_order_the_list_the_menu_and_the_text(self):
         for tier, text in (("3", "any-time thing"), ("0", "the risky one"), ("2", "a review"), ("1", "a yes or no")):

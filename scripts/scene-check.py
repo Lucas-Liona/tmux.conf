@@ -8,7 +8,10 @@ The caller's own environment is the dangerous one: HOME is a temp dir (so a forg
 not to a real file), NEEDS_FILE, NEEDS_CACHE, GEN_DIR and TMUX are unset. The live files' times and the live
 server's @needs_count are read before and after; nothing here writes them.
 """
+import importlib.util
 import json
+import time
+from importlib.machinery import SourceFileLoader
 import os
 import types
 import pwd
@@ -75,6 +78,20 @@ class Scenes(unittest.TestCase):
         env = json.loads(self.scene("run", self.name, "--", "python3", "-c", "import json,os;print(json.dumps(dict(os.environ)))").stdout)
         self.assertEqual(env["TEST"], "1")
         self.assertTrue(env["TMUX"].startswith(str(where)))
+
+    def test_close_leaves_nothing_even_when_a_job_writes_late(self):
+        """2026-11-18: six /tmp/scene-* held only needs.json: the bar's needs job ran after close() and
+        needs --write made its cache's directory again."""
+        loader = importlib.util.spec_from_loader("scene_mod", SourceFileLoader("scene_mod", SCENE))
+        mod = importlib.util.module_from_spec(loader)
+        loader.loader.exec_module(mod)
+        s = mod.Scene()
+        s.start("w", "w", "sh", size=(80, 20), lines=__import__("re").compile(r"^$^"))
+        late = subprocess.Popen(["sh", "-c", "sleep 1; needs --write"], env=s.env)  # as a #() job's child would
+        s.close()
+        late.wait(timeout=10)
+        time.sleep(1)
+        self.assertFalse(s.dir.exists(), f"left: {list(s.dir.rglob('*')) if s.dir.exists() else []}")
 
     def test_run_on_a_scene_that_is_not_up_refuses(self):
         run = self.scene("run", "nosuch" + self.name, "--", "true")

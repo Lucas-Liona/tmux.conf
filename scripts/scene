@@ -113,9 +113,32 @@ class Scene:
         render(self.screen(escapes=True), Path(png))
         return Path(png)
 
+    def stragglers(self) -> list[int]:
+        """Processes still carrying this scene's TMUX_TMPDIR: the servers' jobs and their children."""
+        mark = f"TMUX_TMPDIR={self.dir}".encode()
+        found = []
+        for proc in Path("/proc").iterdir():
+            if proc.name.isdigit() and int(proc.name) != os.getpid():
+                try:
+                    if mark in (proc / "environ").read_bytes().split(b"\0"):
+                        found.append(int(proc.name))
+                except OSError:
+                    continue
+        return found
+
     def close(self) -> None:
+        """Stop both servers, let their jobs finish (up to 5 s, then kill them), then delete the scene. A job
+        that outlived the servers made the directory again (needs --write makes its cache's directory)."""
         for name in ("outer", "inner"):
             subprocess.run(["tmux", "-L", name, "kill-server"], capture_output=True, env=self.server_env())
+        end = time.monotonic() + 5
+        while self.stragglers() and time.monotonic() < end:
+            time.sleep(0.1)
+        for pid in self.stragglers():
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
         shutil.rmtree(self.dir, ignore_errors=True)
 
 

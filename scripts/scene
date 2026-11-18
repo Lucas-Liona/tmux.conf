@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""scene: the one way to build a throwaway tmux scene, for pins and for screenshots.
+
+    scene up <name> [WxH]          a throwaway server with tmux.conf's bar, border and click lines and the live
+                                   colours, and a client of it nested in a second throwaway server (153x39)
+    scene run <name> -- <cmd...>   cmd in the scene's environment: TEST=1, its own needs, gen and tmux server
+    scene tmux <name> <args...>    a tmux command on the scene's server
+    scene shot <name> <png>        the nested client's screen, rendered to a PNG (DejaVu Sans Mono)
+    scene down <name>              stop both servers and delete the scene
+
+As a module (the pins load it): isolated(env, paths) and Scene(). Every scene gets TEST=1, its own
+TMUX_TMPDIR with servers started by -L, and NEEDS_FILE, NEEDS_CACHE, GEN_DIR, NEEDS_OPEN, NEEDS_CLIP and
+NEEDS_VAULT inside its directory, so needs and gen either write there or refuse (exit 3). A scene never
+runs a command on the live server; it only reads the live colours (show-options) when asked to.
+
+Why one helper: on 2026-11-18 a scene built by hand left NEEDS_FILE unset (an unquoted zsh $E is one
+word) and put 4 test asks on Lucas's live badge for 38 s; a guard that needs TEST=1 does not help a scene
+that forgets TEST=1.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONF = HERE.parent / "tmux.conf"
+STATE = ("NEEDS_FILE", "NEEDS_CACHE", "GEN_DIR")
+# the lines a scene takes from tmux.conf: the bar, the pane border, the clicks
+LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status-left|status-left-length|status-right|"
+                   r"status-right-length|@click_label|@title_role) |bind -n MouseDown1Status )")
+LIVE = re.compile(r"^@(thm_|catppuccin_|cap_|click_label|title_role|lucas|fleet)")
+LIVE_STYLES = ("status-style", "pane-border-style", "pane-active-border-style", "window-status-format",
+               "window-status-current-format", "window-status-separator", "status-justify")
+
+
+def temp_roots() -> list[Path]:
+    return [Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve()]
+
+
+def isolated(env: dict, paths: tuple = STATE) -> dict:
+    """env with TEST=1. Refuses (SystemExit) unless every state path in it and TMUX's socket are set and inside
+    a temp directory: one that is missing means the live file or the live server."""
+    inside = lambda value: bool(value) and any(root in Path(value).resolve().parents for root in temp_roots())
+    bad = [name for name in (*paths, "TMUX") if not inside((env.get(name) or "").split(",")[0])]
+    if bad:
+        raise SystemExit(f"refusing to run: {', '.join(bad)} not set to a path under {temp_roots()[0]}")
+    return {**env, "TEST": "1"}
+
+
+class Scene:
+    """A throwaway server ("inner") and a client of it nested in a second one ("outer"), in one temp dir."""
+
+    def __init__(self, path: Path | None = None):
+        self.dir = Path(path) if path else Path(tempfile.mkdtemp(prefix="scene-", dir="/tmp"))  # /tmp: sockets stay short
+        self.dir.mkdir(parents=True, exist_ok=True)
+        sockets = self.dir / f"tmux-{os.getuid()}"
+        self.inner, self.outer = str(sockets / "inner"), str(sockets / "outer")
+        self.opened, self.clipped, self.vault = self.dir / "opened.log", self.dir / "clipped.log", self.dir / "vault"
+        self.vault.mkdir(exist_ok=True)
+        for name, log in (("open", self.opened), ("clip", self.clipped)):  # glz open, clip.exe: written down, not run
+            stub = self.dir / name
+            stub.write_text(f'#!/bin/sh\n{{ printf "%s\\n" "$*"; [ -t 0 ] || cat; }} >> {log}\n')
+            stub.chmod(0o755)
+        base = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE", *STATE)}
+        self.env = isolated({**base, "TMUX_TMPDIR": str(self.dir), "TMUX": f"{self.inner},0,0",
+                             "NEEDS_FILE": str(self.dir / "needs.jsonl"), "NEEDS_CACHE": str(self.dir / "needs.json"),
+                             "GEN_DIR": str(self.dir / "gen"), "NEEDS_OPEN": str(self.dir / "open"),
+                             "NEEDS_CLIP": str(self.dir / "clip"), "NEEDS_VAULT": str(self.vault)})
+
+    def server_env(self) -> dict:
+        """What the scene's server, and so its panes, jobs and popups, start with: TMUX is set inside them by tmux."""
+        return {k: v for k, v in self.env.items() if k != "TMUX"}
+
+    def tmux(self, *args: str) -> str:
+        return subprocess.run(["tmux", "-L", "inner", *args], capture_output=True, text=True,
+                              env=self.server_env()).stdout.rstrip("\n")
+
+    def outer_tmux(self, *args: str) -> str:
+        return subprocess.run(["tmux", "-L", "outer", *args], capture_output=True, text=True,
+                              env=self.server_env()).stdout.rstrip("\n")
+
+    def run(self, *argv: str, **kw) -> subprocess.CompletedProcess:
+        return subprocess.run(list(argv), env=self.env, **kw)
+
+    def start(self, session="scene", window="scene", command="sh", size=(153, 39), lines=LINES, extra=(),
+              live_colours=False) -> "Scene":
+        conf = [line.replace("~/.config/tmux/scripts/", f"{HERE}/") for line in CONF.read_text().splitlines()
+                if lines.match(line)]
+        if live_colours:
+            conf += live_options()
+        (self.dir / "scene.conf").write_text("\n".join([*conf, "set -s escape-time 20", *extra]) + "\n")
+        w, h = size
+        self.tmux("-f", "/dev/null", "new-session", "-d", "-s", session, "-n", window, "-x", str(w), "-y", str(h - 1), command)
+        self.tmux("source-file", str(self.dir / "scene.conf"))
+        attach = f"env -u TMUX TMUX_TMPDIR={self.dir} tmux -L inner attach -t {session}"
+        self.outer_tmux("-f", "/dev/null", "new-session", "-d", "-s", "terminal", "-x", str(w), "-y", str(h), attach)
+        return self
+
+    def screen(self, escapes=False) -> str:
+        return self.outer_tmux("capture-pane", "-p", *(["-e"] if escapes else []), "-t", "terminal:")
+
+    def shot(self, png: Path) -> Path:
+        render(self.screen(escapes=True), Path(png))
+        return Path(png)
+
+    def close(self) -> None:
+        for name in ("outer", "inner"):
+            subprocess.run(["tmux", "-L", name, "kill-server"], capture_output=True, env=self.server_env())
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def live_options() -> list[str]:
+    """The live server's colours and catppuccin pieces, read with show-options: the one look at the live server."""
+    env = {k: v for k, v in os.environ.items() if k not in ("TMUX_TMPDIR",)}
+    show = lambda *a: subprocess.run(["tmux", *a], capture_output=True, text=True, env=env).stdout
+    out = [f"set -g {line}" for line in show("show-options", "-g").splitlines() if LIVE.match(line)]
+    for name in LIVE_STYLES:
+        value = show("show-options", "-gv", name).rstrip("\n")
+        out.append(f"set -g {name} '" + value.replace("'", "'\\''") + "'")
+    return out
+
+
+def render(ansi: str, png: Path) -> None:
+    """capture-pane -e text as a PNG: SGR colours (16, 256, rgb), bold and reverse, one cell per character."""
+    from PIL import Image, ImageDraw, ImageFont
+    fg0, bg0 = (202, 211, 245), (36, 39, 58)  # Catppuccin Macchiato text, base
+    basic = [(0x49, 0x4d, 0x64), (0xed, 0x87, 0x96), (0xa6, 0xda, 0x95), (0xee, 0xd4, 0x9f), (0x8a, 0xad, 0xf4),
+             (0xf5, 0xbd, 0xe6), (0x8b, 0xd5, 0xca), (0xb8, 0xc0, 0xe0)]
+
+    def c256(n):
+        if n < 16:
+            return basic[n % 8]
+        if n < 232:
+            n -= 16
+            v = [0, 95, 135, 175, 215, 255]
+            return v[n // 36], v[n // 6 % 6], v[n % 6]
+        g = 8 + (n - 232) * 10
+        return g, g, g
+    fonts = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono"
+    font, bold = ImageFont.truetype(fonts + ".ttf", 16), ImageFont.truetype(fonts + "-Bold.ttf", 16)
+    cw, ch = 10, 21
+    lines = ansi.split("\n")
+    width = max(len(re.sub(r"\x1b\[[0-9;]*m", "", line)) for line in lines)
+    img = Image.new("RGB", (width * cw + 20, len(lines) * ch + 20), bg0)
+    draw = ImageDraw.Draw(img)
+    for y, line in enumerate(lines):
+        fg, bg, b, rev, x = fg0, None, False, False, 0
+        for token in re.split(r"(\x1b\[[0-9;]*m)", line):
+            sgr = re.fullmatch(r"\x1b\[([0-9;]*)m", token)
+            if sgr:
+                ps, i = [int(p) if p else 0 for p in sgr.group(1).split(";")], 0
+                while i < len(ps):
+                    p = ps[i]
+                    if p == 0:
+                        fg, bg, b, rev = fg0, None, False, False
+                    elif p in (1, 22):
+                        b = p == 1
+                    elif p in (7, 27):
+                        rev = p == 7
+                    elif p == 39:
+                        fg = fg0
+                    elif p == 49:
+                        bg = None
+                    elif 30 <= p <= 37 or 90 <= p <= 97:
+                        fg = basic[p % 10]
+                    elif 40 <= p <= 47 or 100 <= p <= 107:
+                        bg = basic[p % 10]
+                    elif p in (38, 48) and i + 1 < len(ps):
+                        colour = None
+                        if ps[i + 1] == 5 and i + 2 < len(ps):
+                            colour, i = c256(ps[i + 2]), i + 2
+                        elif ps[i + 1] == 2 and i + 4 < len(ps):
+                            colour, i = tuple(ps[i + 2:i + 5]), i + 4
+                        if colour:
+                            fg, bg = (colour, bg) if p == 38 else (fg, colour)
+                    i += 1
+                continue
+            for char in token:
+                ink, paper = ((bg or bg0), fg) if rev else (fg, bg)
+                px, py = 10 + x * cw, 10 + y * ch
+                if paper:
+                    draw.rectangle([px, py, px + cw - 1, py + ch - 1], fill=paper)
+                draw.text((px, py), char, font=bold if b else font, fill=ink)
+                x += 2 if unicodedata.east_asian_width(char) == "W" else 1
+    img.save(png)
+
+
+def named(name: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", name):
+        raise SystemExit(f"scene: {name!r}: letters, digits, - and _ only")
+    return Path("/tmp") / f"scene-{name}"
+
+
+def existing(name: str) -> Path:
+    path = named(name)
+    if not path.is_dir():
+        raise SystemExit(f"scene {name} is not up: scene up {name}")
+    return path
+
+
+def main(argv: list[str]) -> int:
+    match argv:
+        case ["up", name, *size]:
+            path = named(name)
+            if path.exists():
+                raise SystemExit(f"scene {name} is up already ({path}); scene down {name} first")
+            w, h = map(int, size[0].split("x")) if size else (153, 39)
+            Scene(path).start(size=(w, h), live_colours=True)
+            print(path)
+        case ["run", name, "--", *cmd] if cmd:
+            return Scene(existing(name)).run(*cmd).returncode
+        case ["tmux", name, *args]:
+            scene = Scene(existing(name))
+            return subprocess.run(["tmux", "-L", "inner", *args], env=scene.server_env()).returncode
+        case ["shot", name, png]:
+            print(Scene(existing(name)).shot(Path(png)))
+        case ["down", name]:
+            Scene(existing(name)).close()
+        case _:
+            print(__doc__.split("\n\n")[1], file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

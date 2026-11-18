@@ -17,6 +17,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from importlib.machinery import SourceFileLoader
+import importlib.util
+import types
+_loader = SourceFileLoader("scene", str(Path(__file__).resolve().parent / "scene"))
+scene = importlib.util.module_from_spec(importlib.util.spec_from_loader("scene", _loader))
+_loader.exec_module(scene)
+isolated = scene.isolated  # the one helper: scripts/scene
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -32,18 +39,6 @@ TRUST = ["Quick safety check: Is this a project you created or one you trust?", 
 def printing(lines, then=()):
     """A pane program that prints lines and stays."""
     return "printf '%s\\n' " + " ".join("'" + line.replace("'", "'\\''") + "'" for line in [*lines, *then]) + "; exec sleep 600"
-
-
-def isolated(env: dict, paths: tuple) -> dict:
-    """env for the commands under test, with TEST=1. Refuses (SystemExit) unless every state path in it is set
-    and inside the temp directory, and TMUX names a socket there: a missing one means the live file or server.
-    On 2026-11-18 an unset NEEDS_FILE put 4 test asks on Lucas's live badge."""
-    tmp = Path(tempfile.gettempdir()).resolve()
-    inside = lambda value: bool(value) and tmp in Path(value).resolve().parents
-    bad = [name for name in (*paths, "TMUX") if not inside((env.get(name) or "").split(",")[0])]
-    if bad:
-        raise SystemExit(f"refusing to run: {', '.join(bad)} not set to a path under {tmp}")
-    return {**env, "TEST": "1"}
 
 
 class Guard(unittest.TestCase):
@@ -95,39 +90,19 @@ class Writers(unittest.TestCase):
 class Badge(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.dir = tempfile.TemporaryDirectory()
-        tmp = Path(cls.dir.name)
-        cls.inner, cls.outer = str(tmp / "inner"), str(tmp / "outer")
-        cls.asks, cls.cache = tmp / "needs.jsonl", tmp / "needs.json"
-        # glz open and clip.exe as stubs that write down what they were given: no window, no clipboard
-        cls.opened, cls.clipped, cls.vault = tmp / "opened.log", tmp / "clipped.log", tmp / "vault"
-        cls.vault.mkdir()
-        for name, log in (("open", cls.opened), ("clip", cls.clipped)):
-            stub = tmp / name
-            stub.write_text(f'#!/bin/sh\n{{ printf "%s\\n" "$*"; [ -t 0 ] || cat; }} >> {log}\n')
-            stub.chmod(0o755)
-        cls.env = {"NEEDS": NEEDS, "NEEDS_FILE": str(cls.asks), "NEEDS_CACHE": str(cls.cache),
-                   "NEEDS_OPEN": str(tmp / "open"), "NEEDS_CLIP": str(tmp / "clip"), "NEEDS_VAULT": str(cls.vault)}
-        # the server's environment: its panes, jobs and popups get TEST=1, and TMUX is set inside them to this server
-        cls.env = {k: v for k, v in isolated({**cls.env, "TMUX": f"{cls.inner},0,0"}, ("NEEDS_FILE", "NEEDS_CACHE")).items()
-                   if k != "TMUX"}
-        lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
-                 for line in CONF.read_text().splitlines() if LINES.match(line)]
-        assert len(lines) == 5, lines
-        conf = tmp / "badge.conf"
-        conf.write_text("\n".join(lines + ['set -g @thm_red "#ed8796"', 'set -g @thm_crust "#181926"',
-                                           "set -s escape-time 20", "set -g status-interval 1"]) + "\n")
-        cls.tmux(cls.inner, "-f", "/dev/null", "new-session", "-d", "-s", "work", "-n", "home", "-x", "120", "-y", "30",
-                 "cat", env=cls.env)
-        cls.tmux(cls.inner, "source-file", str(conf))
-        cls.tmux(cls.outer, "-f", "/dev/null", "new-session", "-d", "-s", "terminal", "-x", "120", "-y", "30",
-                 f"env -u TMUX tmux -S {cls.inner} attach -t work")
+        cls.scene = s = scene.Scene()  # TEST=1, a -L server of its own, every needs path inside s.dir
+        cls.dir = types.SimpleNamespace(name=str(s.dir))
+        cls.inner, cls.outer = s.inner, s.outer
+        cls.asks, cls.cache = Path(s.env["NEEDS_FILE"]), Path(s.env["NEEDS_CACHE"])
+        cls.opened, cls.clipped, cls.vault = s.opened, s.clipped, s.vault  # glz open, clip.exe: stubs
+        s.env["NEEDS"] = NEEDS
+        s.start("work", "home", "cat", size=(120, 30), lines=LINES,
+                extra=['set -g @thm_red "#ed8796"', 'set -g @thm_crust "#181926"', "set -g status-interval 1"])
+        cls.env = s.server_env()
 
     @classmethod
     def tearDownClass(cls):
-        for sock in (cls.outer, cls.inner):
-            cls.tmux(sock, "kill-server")
-        cls.dir.cleanup()
+        cls.scene.close()
 
     @staticmethod
     def tmux(sock, *args, env=None):

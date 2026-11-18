@@ -16,24 +16,19 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from importlib.machinery import SourceFileLoader
+import importlib.util
+import types
+_loader = SourceFileLoader("scene", str(Path(__file__).resolve().parent / "scene"))
+scene = importlib.util.module_from_spec(importlib.util.spec_from_loader("scene", _loader))
+_loader.exec_module(scene)
+isolated = scene.isolated  # the one helper: scripts/scene
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 CONF = HERE.parent / "tmux.conf"
 GEN = os.environ.get("GEN_BIN", str(Path.home() / ".local/bin/gen"))
 LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status-right) |bind -n MouseDown1Status )")
-
-
-def isolated(env: dict, paths: tuple) -> dict:
-    """env for the commands under test, with TEST=1. Refuses (SystemExit) unless every state path in it is set
-    and inside the temp directory, and TMUX names a socket there: a missing one means the live file or server.
-    On 2026-11-18 an unset NEEDS_FILE put 4 test asks on Lucas's live badge."""
-    tmp = Path(tempfile.gettempdir()).resolve()
-    inside = lambda value: bool(value) and tmp in Path(value).resolve().parents
-    bad = [name for name in (*paths, "TMUX") if not inside((env.get(name) or "").split(",")[0])]
-    if bad:
-        raise SystemExit(f"refusing to run: {', '.join(bad)} not set to a path under {tmp}")
-    return {**env, "TEST": "1"}
 
 
 class Guard(unittest.TestCase):
@@ -108,27 +103,16 @@ class Border(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.dir = tempfile.TemporaryDirectory()
-        tmp = Path(cls.dir.name)
-        cls.inner, cls.outer = str(tmp / "inner"), str(tmp / "outer")
-        cls.env = {k: v for k, v in isolated({"GEN_DIR": str(tmp / "gen"), "PATH": f"{Path(GEN).parent}:{os.environ['PATH']}",
-                                              "TMUX": f"{cls.inner},0,0"}, ("GEN_DIR",)).items() if k != "TMUX"}
-        lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
-                 for line in CONF.read_text().splitlines() if LINES.match(line)]
-        conf = tmp / "gen.conf"
-        conf.write_text("\n".join(lines + ['set -g @thm_overlay_1 "#8087a2"', "set -s escape-time 20"]) + "\n")
-        cls.tmux(cls.inner, "-f", "/dev/null", "new-session", "-d", "-s", "work", "-n", "two", "-x", "120", "-y", "30",
-                 "sh", env=cls.env)
+        cls.scene = s = scene.Scene()  # TEST=1, a -L server of its own, GEN_DIR inside s.dir
+        cls.inner, cls.outer = s.inner, s.outer
+        s.env["PATH"] = f"{Path(GEN).parent}:{os.environ['PATH']}"
+        s.start("work", "two", "sh", size=(120, 30), lines=LINES, extra=['set -g @thm_overlay_1 "#8087a2"'])
         cls.tmux(cls.inner, "split-window", "-h", "-t", "work:two", "sh")
-        cls.tmux(cls.inner, "source-file", str(conf))
-        cls.tmux(cls.outer, "-f", "/dev/null", "new-session", "-d", "-s", "terminal", "-x", "120", "-y", "30",
-                 f"env -u TMUX tmux -S {cls.inner} attach -t work")
+        cls.env = s.server_env()
 
     @classmethod
     def tearDownClass(cls):
-        for sock in (cls.outer, cls.inner):
-            cls.tmux(sock, "kill-server")
-        cls.dir.cleanup()
+        cls.scene.close()
 
     @staticmethod
     def tmux(sock, *args, env=None):

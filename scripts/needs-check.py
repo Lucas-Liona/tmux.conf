@@ -41,7 +41,15 @@ class Badge(unittest.TestCase):
         tmp = Path(cls.dir.name)
         cls.inner, cls.outer = str(tmp / "inner"), str(tmp / "outer")
         cls.asks, cls.cache = tmp / "needs.jsonl", tmp / "needs.json"
-        cls.env = {"NEEDS": NEEDS, "NEEDS_FILE": str(cls.asks), "NEEDS_CACHE": str(cls.cache)}
+        # glz open and clip.exe as stubs that write down what they were given: no window, no clipboard
+        cls.opened, cls.clipped, cls.vault = tmp / "opened.log", tmp / "clipped.log", tmp / "vault"
+        cls.vault.mkdir()
+        for name, log in (("open", cls.opened), ("clip", cls.clipped)):
+            stub = tmp / name
+            stub.write_text(f'#!/bin/sh\n{{ printf "%s\\n" "$*"; [ -t 0 ] || cat; }} >> {log}\n')
+            stub.chmod(0o755)
+        cls.env = {"NEEDS": NEEDS, "NEEDS_FILE": str(cls.asks), "NEEDS_CACHE": str(cls.cache),
+                   "NEEDS_OPEN": str(tmp / "open"), "NEEDS_CLIP": str(tmp / "clip"), "NEEDS_VAULT": str(cls.vault)}
         lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
                  for line in CONF.read_text().splitlines() if LINES.match(line)]
         assert len(lines) == 4, lines
@@ -180,29 +188,107 @@ class Badge(unittest.TestCase):
         self.click("! 1", self.badge())
         self.wait_for("a decision only Lucas makes")
 
-    def test_an_ask_with_a_file_opens_it_read_only_in_a_popup(self):
-        note = Path(self.dir.name) / "decide.md"
-        note.write_text("pick-one-of-these-three\n")
-        self.needs("add", "read the note", "--where", str(note))
-        self.wait_for("! 1 ")
-        self.click("! 1", self.badge())
-        self.wait_for("read the note")
-        self.click("read the note")
-        self.wait_for("pick-one-of-these-three", seconds=30)  # nvim with Lucas's config, in the popup
-        self.assertEqual(note.read_text(), "pick-one-of-these-three\n")
-        self.keys(":q", "Enter")
-        self.wait_for("pick-one-of-these-three", gone=True, seconds=10)
+    def open_card(self, text):
+        """The status badge, then the line holding text: its card opens in a popup."""
+        self.wait_for("! ")
+        self.click("! ", self.badge())
+        self.wait_for(text)
+        self.click(text)
+        self.wait_for("q close", seconds=10)
 
-    def test_an_ask_with_nowhere_shows_its_text(self):
-        self.needs("add", "say yes or no to the plan")
-        self.wait_for("! 1 ")
-        self.click("! 1", self.badge())
-        self.wait_for("say yes or no to the plan")
-        self.click("say yes or no to the plan")
-        self.wait_for("say yes or no to the plan")  # now the message on the status line, not the menu
-        self.assertNotIn("waiting on you", "\n".join(self.screen()))  # the menu closed
-        # -N -d 8000: keys do not clear it, so wait it out, or it covers the next pin's status line
-        self.wait_for("say yes or no to the plan", gone=True, seconds=12)
+    def log(self, path):
+        return path.read_text() if path.exists() else ""
+
+    def nvims(self):
+        return set(subprocess.run(["pgrep", "-x", "nvim"], capture_output=True, text=True).stdout.split())
+
+    def test_tiers_order_the_list_the_menu_and_the_text(self):
+        for tier, text in (("3", "any-time thing"), ("0", "the risky one"), ("2", "a review"), ("1", "a yes or no")):
+            self.needs("add", text, "--tier", tier)
+        self.needs("add", "no tier given")  # 2, after the older tier-2 ask
+        self.needs("--write")
+        items = json.loads(self.needs("--json").stdout)["items"]
+        self.assertEqual([(i["tier"], i["text"]) for i in items], [(0, "the risky one"), (1, "a yes or no"),
+                         (2, "a review"), (2, "no tier given"), (3, "any-time thing")])
+        text = self.needs().stdout
+        self.assertLess(text.index("0 · do first"), text.index("the risky one"))
+        self.assertLess(text.index("the risky one"), text.index("1 · one word from you"))
+        self.assertLess(text.index("2 · read or review"), text.index("3 · any time"))
+        self.click("! 5", self.badge())
+        self.wait_for("any-time thing")
+        rows = "\n".join(self.screen())
+        order = ["0 · do first", "the risky one", "1 · one word from you", "a yes or no", "2 · read or review",
+                 "a review", "no tier given", "3 · any time", "any-time thing"]
+        self.assertEqual([rows.index(x) for x in order], sorted(rows.index(x) for x in order), rows)
+        self.assertEqual(self.needs("add", "x", "--tier", "4").returncode, 2)
+
+    def test_set_changes_an_ask(self):
+        self.needs("add", "move this up")
+        self.assertEqual(self.needs("set", "1", "--tier", "0", "--why", "it got urgent").returncode, 0)
+        self.needs("--write")
+        item = json.loads(self.needs("--json").stdout)["items"][0]
+        self.assertEqual((item["tier"], item["why"], item["text"]), (0, "it got urgent", "move this up"))
+        self.assertEqual(self.needs("set", "9", "--tier", "1").returncode, 1)  # not open
+
+    def test_the_card_is_the_decision_and_its_action_opens_or_copies(self):
+        self.needs("add", "merge the homelab PR", "--tier", "0", "--why", "thin pool at 86.8 percent",
+                   "--recommend", "merge it today", "--action", "https://example.com/pull/186")
+        self.open_card("merge the homelab PR")
+        for text in ("#1 · 0 · do first", "thin pool at 86.8 percent", "merge it today", "https://example.com/pull/186",
+                     "[a] open in the browser"):
+            self.wait_for(text)
+        self.keys("a")
+        self.wait_for("opened in the browser")
+        self.assertIn("https://example.com/pull/186", self.log(self.opened))
+        self.keys("q")
+        self.wait_for("q close", gone=True)
+        self.needs("set", "1", "--action", "make apply")
+        self.open_card("merge the homelab PR")
+        self.wait_for("[a] copy the command")
+        self.keys("a")
+        self.wait_for("command copied")
+        self.assertIn("make apply".encode("utf-16-le"), self.clipped.read_bytes())  # copied, never run
+        self.keys("q")
+
+    def test_a_png_opens_in_windows_and_never_in_nvim(self):
+        """2026-11-18: choosing an item opened 9-phone-floor-after.png in nvim, raw bytes in a popup."""
+        shot = Path(self.dir.name) / "9-phone-floor-after.png"
+        shot.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8)
+        before = self.nvims()
+        self.needs("add", "look at the phone floor", "--where", str(shot))
+        self.open_card("look at the phone floor")
+        self.wait_for("Windows")  # what [1] will do, said on the card
+        self.keys("1")
+        self.wait_for("opened in Windows")
+        self.assertIn(str(shot), self.log(self.opened))
+        self.assertEqual(self.nvims() - before, set())
+        self.assertNotIn("PNG", "\n".join(self.screen()[:-1]))  # no bytes drawn
+        self.keys("q")
+
+    def test_evidence_opens_by_type_text_in_less_vault_notes_in_obsidian(self):
+        note, binary, page = Path(self.dir.name) / "summary.md", Path(self.dir.name) / "blob.bin", self.vault / "Plan.md"
+        note.write_text("pick-one-of-these-three\n")
+        binary.write_bytes(bytes(range(256)))
+        page.write_text("# plan\n")
+        before = self.nvims()
+        self.needs("add", "read the evidence", "--where", str(note), "--where", str(page), "--where", str(binary),
+                   "--where", "https://example.com/x")
+        self.open_card("read the evidence")
+        self.wait_for("read here")
+        self.keys("1")
+        self.wait_for("pick-one-of-these-three", seconds=10)  # less, in the popup
+        self.assertEqual(note.read_text(), "pick-one-of-these-three\n")
+        self.keys("q")
+        self.wait_for("q close")
+        for key, target in (("2", str(page)), ("3", str(binary)), ("4", "https://example.com/x")):
+            self.keys(key)
+            end = time.time() + 5
+            while time.time() < end and target not in self.log(self.opened):
+                time.sleep(0.05)
+            self.assertIn(target, self.log(self.opened))
+        self.assertIn("Obsidian", "\n".join(self.screen()))
+        self.assertEqual(self.nvims() - before, set())
+        self.keys("q")
 
     def test_the_status_job_keeps_n_without_anyone_running_needs(self):
         """No --write from the test: status-left's #() job (scripts/needs-job) does it."""

@@ -1,23 +1,44 @@
 #!/usr/bin/env python3
-"""The ! badge's click: a menu of what waits on Lucas, from `needs --json`; an item goes where it lives.
+"""The ! badge's click: what waits on Lucas by tier, and each ask's decision card.
 
-    needs-menu <client> <file>          write the menu as a tmux command to <file> (the click binding sources it)
-    needs-menu --go <client> <where>    an item: a pane (%12 or session:window.pane) is switched to, a file
-                                        opens read-only in a popup, anything else is shown as a message
+    needs-menu <client> <file>            write the menu as a tmux command to <file> (the click binding sources it)
+    needs-menu --card-popup <client> <id> open the card of ask <id> in a popup on <client> (what an ask's line runs)
+    needs-menu --card <client> <id>       the card itself, inside that popup: q closes it
+    needs-menu --go <client> <where>      a dialog's line: switch <client> to its pane
 
-Written to a file and sourced by the binding, as the ⌘ menu is: a menu a background job opens gets no
-mouse (scripts/status-click). The data is the needs command's; this only draws it.
+The data is the needs command's (needs --json); this only draws it. The menu goes through a file the
+binding sources, as the ⌘ menu does: a menu a background job opens gets no mouse (scripts/status-click).
+
+The card is the decision: title, why, the recommendation, the action, the evidence. Evidence opens by
+what it is and never in an editor (2026-11-18: a .png reached nvim and drew its bytes):
+    a pane                      the client switches to it
+    http(s)                     the browser, through glz open
+    image, video, pdf, folder   the Windows default app, through glz open
+    a .md in the vault          Obsidian, through glz open
+    a text file                 less, read-only, in the card's popup
+    any other file              the Windows default app
+An action that is a URL opens in the browser; any other action is a command, copied, never run.
 """
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import termios
+import textwrap
+import tty
 from pathlib import Path
 
 ME = Path(__file__).resolve()
 NEEDS = os.environ.get("NEEDS", "needs")
-NVIM = "/opt/nvim-linux64/bin/nvim"  # not on the tmux server's PATH
+# glz open: Ctrl+click's opener (skill glazewm, "Clickable links"); it takes WSL paths and URLs as they are
+OPEN = shlex.split(os.environ.get("NEEDS_OPEN", "/mnt/c/Users/lucas/.glzr/glazewm/glz.exe open --focus"))
+VAULT = Path(os.environ.get("NEEDS_VAULT", "/mnt/c/Users/lucas/Vaults"))
+CLIP = shlex.split(os.environ.get("NEEDS_CLIP", "clip.exe"))  # Windows clipboard; reads UTF-16
+TIERS = {0: "do first", 1: "one word from you", 2: "read or review", 3: "any time"}
+WINDOWS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".mp4", ".mov", ".webm", ".mkv", ".mp3",
+           ".wav", ".pdf", ".docx", ".xlsx", ".pptx", ".zip"}
 
 
 def tmux(*args: str) -> subprocess.CompletedProcess:
@@ -29,18 +50,25 @@ def quote(arg: str) -> str:
     return "'" + arg.replace("'", "'\\''") + "'"
 
 
-def go_call(client: str, where: str) -> str:
-    return "run-shell -b " + quote(shlex.join([str(ME), "--go", client, where]))
+def me(*args: str) -> str:
+    return "run-shell -b " + quote(shlex.join([str(ME), *args]))
+
+
+def snapshot() -> dict:
+    return json.loads(subprocess.run([NEEDS, "--json"], capture_output=True, text=True, timeout=10).stdout)
 
 
 def menu(client: str, out: Path) -> None:
     try:
-        snap = json.loads(subprocess.run([NEEDS, "--json"], capture_output=True, text=True, timeout=10).stdout)
-        args = []
-        for n, item in enumerate(snap.get("items", []), 1):
-            label = item["text"] + (f"  ({item['where']})" if item.get("where") else "")
-            args += [label[:70].replace("#", "##"), str(n) if n < 10 else "",
-                     go_call(client, item.get("pane") or item.get("where") or item["text"])]
+        args, tier, n = [], None, 0
+        for item in snapshot().get("items", []):
+            if item.get("tier", 2) != tier:
+                tier = item.get("tier", 2)
+                args += ["-" + f"{tier} · {TIERS.get(tier, '')}", "", ""]  # greyed: a header, not an item
+            n += 1
+            label = f"  {item['id']}  {item['text']}"[:72].replace("#", "##")
+            pane = item.get("pane")
+            args += [label, str(n) if n < 10 else "", me("--go", client, pane) if pane else me("--card-popup", client, item["id"])]
         if not args:
             args = ["-nothing waits on you", "", ""]
     except Exception as error:  # a click that draws nothing reads as a dead button
@@ -50,14 +78,139 @@ def menu(client: str, out: Path) -> None:
     out.write_text(" ".join(map(quote, command)) + "\n")
 
 
-def go(client: str, where: str) -> None:
-    panes = tmux("list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_index}.#{pane_index}").stdout.split()
-    if where in panes:
+def panes() -> set[str]:
+    return set(tmux("list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_index}.#{pane_index}").stdout.split())
+
+
+def is_text(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+    except OSError:
+        return False
+    if b"\0" in head:
+        return False
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError as cut:
+        return cut.start > len(head) - 4  # a character cut at 8192, not binary
+    return True
+
+
+def how(where: str) -> str:
+    """What opening this evidence does: pane, browser, windows, obsidian, less, missing or note."""
+    if where in panes():
+        return "pane"
+    if where.startswith(("http://", "https://")):
+        return "browser"
+    if not where.startswith(("/", "~")):
+        return "note"
+    path = Path(os.path.expanduser(where))
+    if not path.exists():
+        return "missing"
+    if path.is_dir() or path.suffix.lower() in WINDOWS:
+        return "windows"
+    if path.suffix.lower() == ".md" and VAULT in path.resolve().parents:
+        return "obsidian"
+    return "less" if is_text(path) else "windows"
+
+
+SAYS = {"pane": "switch to it", "browser": "browser", "windows": "Windows", "obsidian": "Obsidian",
+        "less": "read here", "missing": "not found", "note": ""}
+
+
+def open_evidence(client: str, where: str) -> str:
+    """Open one piece of evidence by what it is; returns a line for the card. Never an editor."""
+    kind = how(where)
+    if kind == "pane":
         tmux("switch-client", "-c", client, "-t", where)
         tmux("select-window", "-t", where)
         tmux("select-pane", "-t", where)
-    elif Path(os.path.expanduser(where)).is_file():
-        tmux("display-popup", "-c", client, "-E", "-w", "90%", "-h", "85%", f"{NVIM} -R {shlex.quote(os.path.expanduser(where))}")
+        return "exit"
+    if kind in ("browser", "windows", "obsidian"):
+        run = subprocess.run([*OPEN, where], capture_output=True, text=True)
+        return f"opened in {SAYS[kind]}" if run.returncode == 0 else f"could not open: {(run.stderr or run.stdout).strip()[:80]}"
+    if kind == "less":
+        subprocess.run(["less", "-R", os.path.expanduser(where)])
+        return ""
+    return f"{where}: {SAYS[kind] or 'a note, nothing to open'}"
+
+
+def act(action: str) -> str:
+    if action.startswith(("http://", "https://")):
+        run = subprocess.run([*OPEN, action], capture_output=True, text=True)
+        return "opened in the browser" if run.returncode == 0 else "could not open the link"
+    try:
+        subprocess.run(CLIP, input=action.encode("utf-16-le"), check=True, timeout=5)
+        return "command copied: paste it where it belongs"
+    except (OSError, subprocess.SubprocessError):
+        return "could not copy; the command is above"
+
+
+def card_text(item: dict, width: int) -> list[str]:
+    wrap = lambda text, indent: textwrap.wrap(text, max(20, width - indent - 2)) or [""]
+    tier = item.get("tier", 2)
+    lines = [f" \033[1;31m!\033[0m \033[1m#{item['id']}\033[0m · {tier} · {TIERS.get(tier, '')}"
+             + (f"   \033[2m{item.get('by', '')} {item.get('at', '')}\033[0m" if item.get("by") else ""), ""]
+    lines += [" " + line for line in wrap(item["text"], 1)]
+    for name in ("why", "recommend"):
+        if item.get(name):
+            body = wrap(item[name], 13)
+            lines += ["", f" \033[1m{name:<11}\033[0m " + body[0], *[" " * 13 + line for line in body[1:]]]
+    if item.get("action"):
+        kind = "open in the browser" if item["action"].startswith(("http://", "https://")) else "copy the command"
+        body = wrap(item["action"], 13)
+        lines += ["", f" \033[1maction\033[0m      \033[36m{body[0]}\033[0m", *[" " * 13 + f"\033[36m{line}\033[0m" for line in body[1:]],
+                  " " * 13 + f"\033[2m[a] {kind}\033[0m"]
+    if item.get("evidence"):
+        lines += ["", " \033[1mevidence\033[0m"]
+        for n, where in enumerate(item["evidence"][:9], 1):
+            says = SAYS[how(where)]
+            lines.append(f"   [{n}] {where}" + (f"   \033[2m{says}\033[0m" if says else ""))
+    keys = ["q close"] + (["a action"] if item.get("action") else []) + (["1-9 evidence"] if item.get("evidence") else [])
+    return lines + ["", " \033[2m" + " · ".join(keys) + "\033[0m"]
+
+
+def key() -> str:
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd, termios.TCSANOW)  # not the default TCSAFLUSH: it drops a key typed while the card redraws
+        return os.read(fd, 1).decode(errors="replace")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def card(client: str, ident: str) -> int:
+    item = next((i for i in snapshot().get("items", []) if i["id"] == ident), None)
+    if item is None:
+        print(f"#{ident} is not open any more")
+        key()
+        return 0
+    said = ""
+    while True:
+        width = shutil.get_terminal_size().columns
+        sys.stdout.write("\033[2J\033[H" + "\n".join(card_text(item, width)) + (f"\n\n {said}" if said else "") + "\n")
+        sys.stdout.flush()
+        pressed = key()
+        if pressed in ("q", "\x1b", "\x03"):
+            return 0
+        if pressed == "a" and item.get("action"):
+            said = act(item["action"])
+        elif pressed.isdigit() and 0 < int(pressed) <= len(item.get("evidence") or []):
+            said = open_evidence(client, item["evidence"][int(pressed) - 1])
+            if said == "exit":
+                return 0
+
+
+def card_popup(client: str, ident: str) -> None:
+    tmux("display-popup", "-c", client, "-E", "-w", "90%", "-h", "80%", "-T", f" ! #{ident} ",
+         shlex.join([str(ME), "--card", client, ident]))
+
+
+def go(client: str, where: str) -> None:
+    if where in panes():
+        open_evidence(client, where)
     else:
         tmux("display-message", "-N", "-d", "8000", "-c", client, where)  # -N: the click's release would clear it
 
@@ -66,6 +219,10 @@ def main(argv: list[str]) -> int:
     match argv:
         case ["--go", client, where]:
             go(client, where)
+        case ["--card-popup", client, ident]:
+            card_popup(client, ident)
+        case ["--card", client, ident]:
+            return card(client, ident)
         case [client, out] if not client.startswith("-"):
             menu(client, Path(out))
         case _:

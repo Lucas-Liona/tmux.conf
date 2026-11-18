@@ -10,6 +10,7 @@ server's @needs_count are read before and after; nothing here writes them.
 """
 import json
 import os
+import pwd
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,9 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 SCENE = os.environ.get("SCENE_BIN", str(HERE / "scene"))
-LIVE_FILES = [Path.home() / ".cache/panel/needs.jsonl", Path.home() / ".cache/panel/gen.jsonl"]
+# the real home from the user database, not $HOME: this file may itself run under a temp HOME
+REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+LIVE_FILES = [REAL_HOME / ".cache/panel/needs.jsonl", REAL_HOME / ".cache/panel/gen.jsonl"]
 
 
 def stamp(path: Path):
@@ -31,8 +34,7 @@ class Scenes(unittest.TestCase):
         self.home = tempfile.TemporaryDirectory()
         self.env = {**{k: v for k, v in os.environ.items()
                        if k not in ("TMUX", "TMUX_PANE", "NEEDS_FILE", "NEEDS_CACHE", "GEN_DIR", "TEST", "TMUX_TMPDIR")},
-                    "HOME": self.home.name, "PATH": f"{Path.home() / '.local/bin'}:{os.environ['PATH']}",
-                    "PYTHONUSERBASE": str(Path.home() / ".local")}  # PIL lives there; HOME stays the temp one
+                    "HOME": self.home.name, "PATH": f"{REAL_HOME / '.local/bin'}:{os.environ['PATH']}"}
         self.name = f"pin{os.getpid()}"
         self.addCleanup(self.home.cleanup)
         self.addCleanup(subprocess.run, [SCENE, "down", self.name], capture_output=True, env=self.env)

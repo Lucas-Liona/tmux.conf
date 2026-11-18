@@ -127,7 +127,15 @@ def live_options() -> list[str]:
 
 def render(ansi: str, png: Path) -> None:
     """capture-pane -e text as a PNG: SGR colours (16, 256, rgb), bold and reverse, one cell per character."""
-    from PIL import Image, ImageDraw, ImageFont
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        # PIL is in Lucas's user site, which Python finds through $HOME; a scene may run under a temp HOME.
+        # The real home comes from the user database (lucas2-inbox reproduced the ModuleNotFoundError, 2026-11-18).
+        import pwd
+        real = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        sys.path.append(str(real / f".local/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"))
+        from PIL import Image, ImageDraw, ImageFont
     fg0, bg0 = (202, 211, 245), (36, 39, 58)  # Catppuccin Macchiato text, base
     basic = [(0x49, 0x4d, 0x64), (0xed, 0x87, 0x96), (0xa6, 0xda, 0x95), (0xee, 0xd4, 0x9f), (0x8a, 0xad, 0xf4),
              (0xf5, 0xbd, 0xe6), (0x8b, 0xd5, 0xca), (0xb8, 0xc0, 0xe0)]

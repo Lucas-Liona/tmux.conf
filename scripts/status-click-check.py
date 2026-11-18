@@ -122,7 +122,7 @@ class Click(unittest.TestCase):
         self.menu.write_text(MENU)
         self.pane = self.tmux(self.inner, "new-window", "-t", "riverboat:", "-P", "-F", "#{pane_id}",
                               "-c", str(self.work), "cat")
-        self.wait_for("⌘ menu")
+        self.wait_for("menu ⌘")
 
     def tearDown(self):
         self.keys("Escape")  # a menu or a popup left open by a failed pin
@@ -170,21 +170,21 @@ class Click(unittest.TestCase):
 
     def test_the_label_is_the_role_and_the_badge(self):
         self.tmux(self.inner, "rename-window", "-t", self.pane, "control")
-        self.wait_for("⌘ control")
+        self.wait_for("control ⌘")
         self.tmux(self.inner, "set-option", "-p", "-t", self.pane, "@skill_badge", "meta +1")
-        self.wait_for("⌘ control · meta +1")
+        self.wait_for("control · meta +1 ⌘")
         self.tmux(self.inner, "set-option", "-w", "-t", self.pane, "automatic-rename", "on")
-        self.wait_for("⌘ meta +1")
+        self.wait_for("meta +1 ⌘")
 
     def test_a_click_opens_the_menu_and_it_stays_after_the_button_comes_up(self):
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("say hi")
         time.sleep(0.5)
         for text in ("say hi", "(h)", "rename", "(r)", "no key"):
             self.assertIsNotNone(self.where(text), text)
 
     def test_clicking_an_sh_item_runs_it_in_a_popup_in_the_panes_directory(self):
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("say hi")
         self.click("say hi")
         self.wait_for(f"popup-says-{self.pane}-in-{self.work}-menu-{self.menu}", seconds=45)  # zsh -i: up to 11 s under load
@@ -194,14 +194,14 @@ class Click(unittest.TestCase):
     def test_a_bad_first_line_still_opens_the_menu(self):
         """Its greyed label starts with "-", which display-menu read as a flag before the "--"."""
         self.menu.write_text("this line has no action\n" + MENU)
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("line 1: this line has no action")
         self.wait_for("say hi")
 
     def test_the_menu_is_written_for_this_client_alone(self):
         """Red team 2026-11-17 #14: one file per server let two clients' clicks overwrite each other's menu."""
         pid = self.tmux(self.inner, "list-clients", "-F", "#{client_pid}")
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("say hi")
         mine = Path(f"{self.inner}.click-menu-{pid}")
         self.assertTrue(mine.exists())
@@ -209,13 +209,13 @@ class Click(unittest.TestCase):
 
     def test_a_menu_that_cannot_be_built_says_why_instead_of_a_dead_click(self):
         self.menu.write_bytes(b"say hi  sh: true \xff\n")  # not UTF-8: reading it raises
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("click menu failed: UnicodeDecodeError")
         self.wait_for("edit this menu")
 
     def test_an_sh_line_edited_while_the_menu_is_open_is_refused_not_run(self):
         """Red team 2026-11-17 #14: the click ran whatever sat on the line number by then."""
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("say hi")
         text = self.menu.read_text()
         self.assertIn("say hi      h  sh: print popup-says", text)
@@ -227,11 +227,11 @@ class Click(unittest.TestCase):
         self.assertNotIn("popup-says", self.screen())
 
     def test_a_tmux_item_runs_with_the_clicked_panes_formats_by_key_or_by_mouse(self):
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("rename")
         self.keys("r")
         self.wait_for("riverboat clicked")
-        self.click("⌘ ")  # the label is now the window's new name
+        self.click(" ⌘")  # the label before it is now the window's new name
         self.wait_for("no key")
         self.click("no key")
         for _ in range(40):
@@ -243,24 +243,24 @@ class Click(unittest.TestCase):
     def test_an_edit_shows_on_the_next_click_with_nothing_reloaded(self):
         with self.menu.open("a") as f:
             f.write("added just now  sh: true\n")
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("added just now")
 
     def test_a_bad_line_is_greyed_with_its_number_and_the_rest_works(self):
         with self.menu.open("a") as f:
             f.write("this line has no action\n")
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("line 6: this line has no action")
         self.keys("r")
         self.wait_for("riverboat clicked")
 
     def test_no_file_still_offers_the_way_in(self):
         self.menu.unlink()
-        self.click("⌘ menu")
+        self.click("menu ⌘")
         self.wait_for("edit this menu")
 
     def test_a_right_click_opens_the_file_in_the_editor(self):
-        self.click("⌘ menu", RIGHT)
+        self.click("menu ⌘", RIGHT)
         self.wait_for("say hi      h  sh: print", seconds=20)  # the file's own text, in nvim
         self.keys(":q!")
         time.sleep(0.3)  # his nvim drops an Enter that arrives in the same burst as the command
@@ -309,6 +309,34 @@ class Click(unittest.TestCase):
         self.assertEqual(before.count("mouse_status_range"), 1, before)
         subprocess.run([str(SCRIPT), "--bind"], env={**os.environ, "TMUX": f"{self.inner},0,0"})
         self.assertEqual(self.tmux(self.inner, "list-keys", "-T", "root", "MouseDown3Status"), before)
+
+
+
+class Folder(unittest.TestCase):
+    """Lucas, daily note 2026-11-18: "keep menu popup button next to folder". A long label (a pane's skill
+    badges) sat between the ⌘ and the folder and pushed the folder off the bar ("luca")."""
+
+    def test_the_button_sits_beside_the_folder_and_the_folder_is_whole(self):
+        loader = SourceFileLoader("scene", str(HERE / "scene"))
+        scene = importlib.util.module_from_spec(importlib.util.spec_from_loader("scene", loader))
+        loader.exec_module(scene)
+        s = scene.Scene()
+        self.addCleanup(s.close)
+        s.start("lucas2", "zsh", "sh", size=(153, 39), live_colours=True)
+        folder = s.dir / "lucas"
+        folder.mkdir()
+        s.tmux("send-keys", "-t", "lucas2:", f"cd {folder}", "Enter")
+        s.tmux("set-option", "-p", "-t", "lucas2:", "@skill_badge", "time-budget playwright collect +10")
+        end, row = time.monotonic() + 8, ""
+        while time.monotonic() < end:
+            row = s.screen().split("\n")[-1].rstrip()
+            if re.search(r"lucas[^A-Za-z0-9]*$", row):  # the folder pill ends in its cap glyph
+                break
+            time.sleep(0.2)
+        self.assertTrue(re.search(r"lucas[^A-Za-z0-9]*$", row), f"the folder is cut or missing: {row!r}")
+        between = row[row.rindex("⌘") + 1:row.rindex("lucas")]
+        self.assertFalse(re.search(r"[A-Za-z0-9]", between), f"between the ⌘ and the folder: {between!r}")
+        self.assertNotIn("time-budget playwright collect +10", row)  # the label is cut short, before the ⌘
 
 
 if __name__ == "__main__":

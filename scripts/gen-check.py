@@ -24,10 +24,44 @@ GEN = os.environ.get("GEN_BIN", str(Path.home() / ".local/bin/gen"))
 LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status-right) |bind -n MouseDown1Status )")
 
 
+def isolated(env: dict, paths: tuple) -> dict:
+    """env for the commands under test, with TEST=1. Refuses (SystemExit) unless every state path in it is set
+    and inside the temp directory, and TMUX names a socket there: a missing one means the live file or server.
+    On 2026-11-18 an unset NEEDS_FILE put 4 test asks on Lucas's live badge."""
+    tmp = Path(tempfile.gettempdir()).resolve()
+    inside = lambda value: bool(value) and tmp in Path(value).resolve().parents
+    bad = [name for name in (*paths, "TMUX") if not inside((env.get(name) or "").split(",")[0])]
+    if bad:
+        raise SystemExit(f"refusing to run: {', '.join(bad)} not set to a path under {tmp}")
+    return {**env, "TEST": "1"}
+
+
+class Guard(unittest.TestCase):
+    """With TEST=1, gen refuses the live ring and the live tmux server. HOME and TMUX_TMPDIR are temp dirs."""
+
+    def run_gen(self, home, **env):
+        base = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE", "GEN_DIR")}
+        return subprocess.run([GEN, "bump", "startup"], capture_output=True, text=True,
+                              env={**base, "HOME": home, "TMUX_TMPDIR": home, "TEST": "1", **env})
+
+    def test_gen_under_test_refuses_an_unset_dir_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as home:
+            run = self.run_gen(home, TMUX=f"{home}/none,0,0")
+            self.assertNotEqual(run.returncode, 0)
+            self.assertFalse((Path(home) / ".cache").exists(), "it wrote the default (live) ring")
+
+    def test_gen_under_test_refuses_the_live_tmux_server(self):
+        with tempfile.TemporaryDirectory() as home:
+            run = self.run_gen(home, GEN_DIR=f"{home}/gen", TMUX_PANE="%0")  # no TMUX: the default server
+            self.assertNotEqual(run.returncode, 0)
+            self.assertFalse((Path(home) / "gen").exists())
+
+
 class Counter(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
-        self.env = {**{k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}, "GEN_DIR": self.dir.name}
+        self.env = isolated({**{k: v for k, v in os.environ.items() if k != "TMUX_PANE"}, "GEN_DIR": self.dir.name,
+                             "TMUX": f"{self.dir.name}/none,0,0"}, ("GEN_DIR",))
 
     def tearDown(self):
         self.dir.cleanup()
@@ -77,7 +111,8 @@ class Border(unittest.TestCase):
         cls.dir = tempfile.TemporaryDirectory()
         tmp = Path(cls.dir.name)
         cls.inner, cls.outer = str(tmp / "inner"), str(tmp / "outer")
-        cls.env = {"GEN_DIR": str(tmp / "gen"), "PATH": f"{Path(GEN).parent}:{os.environ['PATH']}"}
+        cls.env = {k: v for k, v in isolated({"GEN_DIR": str(tmp / "gen"), "PATH": f"{Path(GEN).parent}:{os.environ['PATH']}",
+                                              "TMUX": f"{cls.inner},0,0"}, ("GEN_DIR",)).items() if k != "TMUX"}
         lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
                  for line in CONF.read_text().splitlines() if LINES.match(line)]
         conf = tmp / "gen.conf"
@@ -114,7 +149,8 @@ class Border(unittest.TestCase):
 
     def test_each_border_shows_its_own_panes_last_value(self):
         left, right = self.tmux(self.inner, "list-panes", "-t", "work:two", "-F", "#{pane_id}").split("\n")
-        base = int(json.loads(subprocess.run([GEN, "--json"], capture_output=True, text=True, env={**os.environ, **self.env}).stdout)["n"])
+        base = int(json.loads(subprocess.run([GEN, "--json"], capture_output=True, text=True,
+                                             env={**os.environ, **self.env, "TMUX": f"{self.inner},0,0"}).stdout)["n"])
         for pane, times in ((left, 3), (right, 1)):  # left: base+1..base+3; then right: base+4
             for _ in range(times):
                 self.tmux(self.inner, "send-keys", "-t", pane, "gen bump startup >/dev/null", "Enter")

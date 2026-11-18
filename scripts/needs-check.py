@@ -34,12 +34,57 @@ def printing(lines, then=()):
     return "printf '%s\\n' " + " ".join("'" + line.replace("'", "'\\''") + "'" for line in [*lines, *then]) + "; exec sleep 600"
 
 
+def isolated(env: dict, paths: tuple) -> dict:
+    """env for the commands under test, with TEST=1. Refuses (SystemExit) unless every state path in it is set
+    and inside the temp directory, and TMUX names a socket there: a missing one means the live file or server.
+    On 2026-11-18 an unset NEEDS_FILE put 4 test asks on Lucas's live badge."""
+    tmp = Path(tempfile.gettempdir()).resolve()
+    inside = lambda value: bool(value) and tmp in Path(value).resolve().parents
+    bad = [name for name in (*paths, "TMUX") if not inside((env.get(name) or "").split(",")[0])]
+    if bad:
+        raise SystemExit(f"refusing to run: {', '.join(bad)} not set to a path under {tmp}")
+    return {**env, "TEST": "1"}
+
+
+class Guard(unittest.TestCase):
+    """With TEST=1, needs refuses to touch live state; the suite refuses to start without temp paths. HOME and
+    TMUX_TMPDIR point into a temp dir, so even a needs without the guard writes nowhere real."""
+
+    def run_needs(self, home, **env):
+        base = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE", "NEEDS_FILE", "NEEDS_CACHE")}
+        return subprocess.run([NEEDS, "add", "a test ask"], capture_output=True, text=True,
+                              env={**base, "HOME": home, "TMUX_TMPDIR": home, "TEST": "1", **env})
+
+    def test_needs_under_test_refuses_an_unset_file_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as home:
+            run = self.run_needs(home, TMUX=f"{home}/none,0,0")
+            self.assertNotEqual(run.returncode, 0)
+            self.assertFalse((Path(home) / ".cache").exists(), "it wrote the default (live) path")
+
+    def test_needs_under_test_refuses_the_live_tmux_server(self):
+        with tempfile.TemporaryDirectory() as home:
+            run = self.run_needs(home, NEEDS_FILE=f"{home}/n.jsonl", NEEDS_CACHE=f"{home}/n.json")  # no TMUX
+            self.assertNotEqual(run.returncode, 0)
+            self.assertFalse((Path(home) / "n.jsonl").exists())
+
+    def test_the_suite_refuses_to_start_without_temp_paths(self):
+        live = str(Path.home() / ".cache/panel/needs.jsonl")
+        with self.assertRaises(SystemExit):
+            isolated({"NEEDS_FILE": live, "NEEDS_CACHE": "/tmp/x/n.json", "TMUX": "/tmp/x/s,0,0"}, ("NEEDS_FILE", "NEEDS_CACHE"))
+        with self.assertRaises(SystemExit):
+            isolated({"NEEDS_CACHE": "/tmp/x/n.json", "TMUX": "/tmp/x/s,0,0"}, ("NEEDS_FILE", "NEEDS_CACHE"))
+        ok = isolated({"NEEDS_FILE": "/tmp/x/n.jsonl", "NEEDS_CACHE": "/tmp/x/n.json", "TMUX": "/tmp/x/s,0,0"},
+                      ("NEEDS_FILE", "NEEDS_CACHE"))
+        self.assertEqual(ok["TEST"], "1")
+
+
 class Writers(unittest.TestCase):
     def test_two_writers_at_once_never_crash(self):
         """The bar's job and an agent's needs add both write the cache. With one shared .part file, the
         second rename found it already moved: 2 FileNotFoundError in 120 writes (2026-11-18)."""
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "NEEDS_FILE": f"{tmp}/n.jsonl", "NEEDS_CACHE": f"{tmp}/n.json", "TMUX": f"{tmp}/none,0,0"}
+            env = isolated({**os.environ, "NEEDS_FILE": f"{tmp}/n.jsonl", "NEEDS_CACHE": f"{tmp}/n.json", "TMUX": f"{tmp}/none,0,0"},
+                           ("NEEDS_FILE", "NEEDS_CACHE"))
             loop = f"for i in $(seq 60); do {NEEDS} --write; done"
             writers = [subprocess.Popen(["sh", "-c", loop], env=env, stderr=subprocess.PIPE, text=True) for _ in range(2)]
             errors = "".join(w.communicate()[1] for w in writers)
@@ -63,6 +108,9 @@ class Badge(unittest.TestCase):
             stub.chmod(0o755)
         cls.env = {"NEEDS": NEEDS, "NEEDS_FILE": str(cls.asks), "NEEDS_CACHE": str(cls.cache),
                    "NEEDS_OPEN": str(tmp / "open"), "NEEDS_CLIP": str(tmp / "clip"), "NEEDS_VAULT": str(cls.vault)}
+        # the server's environment: its panes, jobs and popups get TEST=1, and TMUX is set inside them to this server
+        cls.env = {k: v for k, v in isolated({**cls.env, "TMUX": f"{cls.inner},0,0"}, ("NEEDS_FILE", "NEEDS_CACHE")).items()
+                   if k != "TMUX"}
         lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
                  for line in CONF.read_text().splitlines() if LINES.match(line)]
         assert len(lines) == 5, lines

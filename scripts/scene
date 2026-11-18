@@ -91,7 +91,8 @@ class Scene:
         return subprocess.run(list(argv), env=self.env, **kw)
 
     def start(self, session="scene", window="scene", command="sh", size=(153, 39), lines=LINES, extra=(),
-              live_colours=False) -> "Scene":
+              live_colours=False, client_term="") -> "Scene":
+        """client_term: the nested client's TERM (Lucas's WezTerm says xterm-256color), for features by pattern."""
         conf = [line.replace("~/.config/tmux/scripts/", f"{HERE}/") for line in CONF.read_text().splitlines()
                 if lines.match(line)]
         if live_colours:
@@ -100,7 +101,8 @@ class Scene:
         w, h = size
         self.tmux("-f", "/dev/null", "new-session", "-d", "-s", session, "-n", window, "-x", str(w), "-y", str(h - 1), command)
         self.tmux("source-file", str(self.dir / "scene.conf"))
-        attach = f"env -u TMUX TMUX_TMPDIR={self.dir} tmux -L inner attach -t {session}"
+        term = f"TERM={client_term} " if client_term else ""
+        attach = f"env -u TMUX {term}TMUX_TMPDIR={self.dir} tmux -L inner attach -t {session}"
         self.outer_tmux("-f", "/dev/null", "new-session", "-d", "-s", "terminal", "-x", str(w), "-y", str(h), attach)
         return self
 

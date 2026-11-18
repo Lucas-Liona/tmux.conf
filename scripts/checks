@@ -1,0 +1,18 @@
+#!/bin/sh
+# Every pin suite in this directory (*-check.py), one line each, and every output kept, so a failure that
+# does not come back is still there to read. Exit 1 when any suite fails: what CI runs.
+#     ~/.config/tmux/scripts/checks          outputs in ~/.cache/tmux-checks/<date-time>/
+here=$(cd "$(dirname "$0")" && pwd)
+out="$HOME/.cache/tmux-checks/$(date +%Y-%m-%d-%H%M%S)"
+mkdir -p "$out"
+failed=0
+for suite in "$here"/*-check.py; do
+    name=$(basename "$suite" .py)
+    timeout -s KILL 600 python3 -B "$suite" > "$out/$name.out" 2>&1
+    result=$(grep -E '^(OK|FAILED)' "$out/$name.out" | tail -1)
+    [ -n "$result" ] || result="NO RESULT (killed or crashed)"
+    case "$result" in OK*) ;; *) failed=1 ;; esac
+    printf '%-24s %s\n' "$name" "$result"
+done
+echo "outputs: $out"
+exit $failed

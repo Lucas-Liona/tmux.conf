@@ -1,0 +1,15 @@
+#!/bin/sh
+# status-left's #() job for Lucas's state: runs `state lucas --input` (typing, active or afk, from the time
+# of his last keyboard or mouse input on Windows; no key is read) at most once every EVERY seconds for the
+# whole server, in the background with its output closed, so the bar never waits for its ~1 s PowerShell.
+# From the tmux server because its shells keep a live WSL interop socket; systemd and cron lost theirs
+# when wslhost was killed (2026-11-18). The gate is window-models-job's: tmux starts a #() job on any
+# redraw in a new second, once per client.
+EVERY=${LUCAS_INPUT_EVERY:-30}
+stamp="${TMUX%%,*}.lucas-input"
+now=$(date +%s)
+last=0
+[ -r "$stamp" ] && read -r last < "$stamp"
+[ $((now - ${last:-0})) -lt "$EVERY" ] && exit 0
+echo "$now" > "$stamp"
+"${STATE:-state}" lucas --input > /dev/null 2>&1 &

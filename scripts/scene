@@ -10,7 +10,7 @@
 
 As a module (the pins load it): isolated(env, paths) and Scene(). Every scene gets TEST=1, its own
 TMUX_TMPDIR with servers started by -L, and NEEDS_FILE, NEEDS_CACHE, GEN_DIR, NEEDS_OPEN, NEEDS_CLIP and
-NEEDS_VAULT inside its directory, so needs and gen either write there or refuse (exit 3). A scene never
+NEEDS_VAULT inside its directory and STATE a stub, so needs and gen either write there or refuse (exit 3). A scene never
 runs a command on the live server; it only reads the live colours (show-options) when asked to.
 
 Why one helper: on 2026-11-18 a scene built by hand left NEEDS_FILE unset (an unquoted zsh $E is one
@@ -61,8 +61,10 @@ class Scene:
         sockets = self.dir / f"tmux-{os.getuid()}"
         self.inner, self.outer = str(sockets / "inner"), str(sockets / "outer")
         self.opened, self.clipped, self.vault = self.dir / "opened.log", self.dir / "clipped.log", self.dir / "vault"
+        self.stated = self.dir / "state.log"
         self.vault.mkdir(exist_ok=True)
-        for name, log in (("open", self.opened), ("clip", self.clipped)):  # glz open, clip.exe: written down, not run
+        # glz open, clip.exe and state (whose --input writes the real state.json): written down, not run
+        for name, log in (("open", self.opened), ("clip", self.clipped), ("state", self.stated)):
             stub = self.dir / name
             stub.write_text(f'#!/bin/sh\n{{ printf "%s\\n" "$*"; [ -t 0 ] || cat; }} >> {log}\n')
             stub.chmod(0o755)
@@ -70,7 +72,8 @@ class Scene:
         self.env = isolated({**base, "TMUX_TMPDIR": str(self.dir), "TMUX": f"{self.inner},0,0",
                              "NEEDS_FILE": str(self.dir / "needs.jsonl"), "NEEDS_CACHE": str(self.dir / "needs.json"),
                              "GEN_DIR": str(self.dir / "gen"), "NEEDS_OPEN": str(self.dir / "open"),
-                             "NEEDS_CLIP": str(self.dir / "clip"), "NEEDS_VAULT": str(self.vault)})
+                             "NEEDS_CLIP": str(self.dir / "clip"), "NEEDS_VAULT": str(self.vault),
+                             "STATE": str(self.dir / "state")})
 
     def server_env(self) -> dict:
         """What the scene's server, and so its panes, jobs and popups, start with: TMUX is set inside them by tmux."""

@@ -107,5 +107,36 @@ class Restore(unittest.TestCase):
         self.assertEqual(s.tmux("display-message", "-p", "-t", self.sidebar, "#{pane_title} #{pane_width}"), "workmux-sidebar 22")
 
 
+
+class Top(unittest.TestCase):
+    """Lucas, 2026-11-18: "when will status move to top?". With his config the bar is the first row, the pane
+    border line (! badge left, gen right) the second, and the ⌘ menu still opens on screen when clicked."""
+
+    def test_the_bar_is_on_top_above_the_border_and_its_menu_opens(self):
+        s = scene.Scene()
+        self.addCleanup(s.close)
+        conf = s.dir / "tmux.conf"
+        copy_of_his_conf(conf)
+        s.start("main", "lucas2", "sh", size=(153, 39), config=conf, live_colours=True)
+        for n in range(3):  # the bar's needs job recounts from the scene's own needs file
+            s.run("needs", "add", f"scene ask {n}", capture_output=True)
+        time.sleep(1.5)
+        rows = s.screen().split("\n")
+        self.assertIn("⌘", rows[0], f"row 0 is not the bar: {rows[0]!r} (last row: {rows[-1]!r})")
+        self.assertTrue(rows[1].lstrip().startswith("─"), f"row 1 is not the border: {rows[1]!r}")
+        self.assertIn("! 3", rows[1])
+        col = rows[0].index("⌘") + 1
+        time.sleep(0.35)
+        for button, down in ((35, True), (0, True), (0, False)):
+            s.outer_tmux("send-keys", "-t", "terminal:", "-l", f"\033[<{button};{col};1{'M' if down else 'm'}")
+            time.sleep(0.05)
+        end, menu = time.monotonic() + 6, ""
+        while time.monotonic() < end and "panel" not in menu:
+            time.sleep(0.1)
+            menu = s.screen()
+        self.assertIn("panel", menu, "the ⌘ menu did not open from the top bar")
+        self.assertIn("aq", menu)  # the menu's rows are on screen, not cut off above the top
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

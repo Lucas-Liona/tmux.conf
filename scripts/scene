@@ -104,6 +104,9 @@ class Scene:
                   "-x", str(w), "-y", str(h - 1), command)
         if not config:
             self.tmux("source-file", str(self.dir / "scene.conf"))
+        elif live_colours:  # a config copy without its plugins: catppuccin's colours come from the live server
+            (self.dir / "colours.conf").write_text("\n".join(live_options()) + "\n")
+            self.tmux("source-file", str(self.dir / "colours.conf"))
         term = f"TERM={client_term} " if client_term else ""
         attach = f"env -u TMUX {term}TMUX_TMPDIR={self.dir} tmux -L inner attach -t {session}"
         self.outer_tmux("-f", "/dev/null", "new-session", "-d", "-s", "terminal", "-x", str(w), "-y", str(h), attach)

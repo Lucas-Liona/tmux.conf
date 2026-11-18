@@ -216,10 +216,11 @@ class Badge(unittest.TestCase):
         self.assertNotIn("! ", self.screen()[0])  # the border keeps its row (gen is on it) but loses the badge
         self.assertEqual(self.needs().stdout.strip(), "nothing waits on you")
 
-    def test_the_badge_is_on_the_border_line_and_the_status_badge_opens_the_list(self):
+    def test_the_badge_is_on_the_bar_not_the_border_and_it_opens_the_list(self):
+        """Lucas, 2026-11-18, needs 49: "A": with the bar on top, the border copy of the badge went."""
         self.needs("add", "a decision only Lucas makes")
         self.wait_for("! 1 ")
-        self.assertTrue(self.screen()[0].startswith("── ! 1 "))  # top left of the pane's border line
+        self.assertFalse(any("! 1" in row for row in self.screen() if row.lstrip().startswith("─")), self.screen()[:2])
         self.click("! 1", self.badge())
         self.wait_for("a decision only Lucas makes")
 

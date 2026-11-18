@@ -124,7 +124,8 @@ class Top(unittest.TestCase):
         rows = s.screen().split("\n")
         self.assertIn("⌘", rows[0], f"row 0 is not the bar: {rows[0]!r} (last row: {rows[-1]!r})")
         self.assertTrue(rows[1].lstrip().startswith("─"), f"row 1 is not the border: {rows[1]!r}")
-        self.assertIn("! 3", rows[1])
+        self.assertIn("! 3", rows[0])  # the badge: on the bar, top left, once
+        self.assertNotIn("! 3", rows[1])  # not again on the border line below (Lucas, needs 49: "A")
         col = rows[0].index("⌘") + 1
         time.sleep(0.35)
         for button, down in ((35, True), (0, True), (0, False)):

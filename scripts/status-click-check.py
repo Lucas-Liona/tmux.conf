@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "status-click"
 CONF = HERE.parent / "tmux.conf"
 DEFAULTS = HERE.parent / "click-menu.conf"
-LINES = re.compile(r"^(set -g (mouse|@title_role|@click_label|status-right) |bind -n MouseDown1Status |"
+LINES = re.compile(r"^(set -g (mouse|@title_role|@click_label|status|status-format\[\d\]|status-right) |bind -n MouseDown1Status |"
                    r"run-shell .*(MouseDown3|status-click))")
 LEFT, RIGHT, MOVE = 0, 2, 35  # SGR mouse buttons; 35 is a move with none held
 
@@ -95,7 +95,7 @@ class Click(unittest.TestCase):
         cls.work.mkdir()
         lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
                  for line in CONF.read_text().splitlines() if LINES.match(line)]
-        assert len(lines) == 7, lines
+        assert len(lines) == 10, lines  # with status 2 and both status-format lines
         conf = tmp / "click.conf"
         # escape-time as on the live server: at tmux's 500 ms a lone Escape swallows the mouse bytes after it
         conf.write_text("\n".join(lines + ['set -g @thm_mauve "#c6a0f6"', "set -s escape-time 20"]) + "\n")
@@ -123,6 +123,9 @@ class Click(unittest.TestCase):
         self.pane = self.tmux(self.inner, "new-window", "-t", "riverboat:", "-P", "-F", "#{pane_id}",
                               "-c", str(self.work), "cat")
         self.wait_for("menu ⌘")
+        # A message left by the last pin sits on the bar's first line, and the first click only clears it. With
+        # one line it also hid the ⌘, so the wait above covered it; with two the ⌘ stays in view.
+        self.wait_for("changed since the menu opened", gone=True)
 
     def tearDown(self):
         self.keys("Escape")  # a menu or a popup left open by a failed pin
@@ -329,7 +332,7 @@ class Folder(unittest.TestCase):
         s.tmux("set-option", "-p", "-t", "lucas2:", "@skill_badge", "time-budget playwright collect +10")
         end, row = time.monotonic() + 8, ""
         while time.monotonic() < end:
-            row = s.screen().split("\n")[-1].rstrip()
+            row = s.screen().split("\n")[1].rstrip()  # the bar's second line, under the badge's
             if re.search(r"lucas[^A-Za-z0-9]*$", row):  # the folder pill ends in its cap glyph
                 break
             time.sleep(0.2)

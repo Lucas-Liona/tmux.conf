@@ -31,7 +31,8 @@ HERE = Path(__file__).resolve().parent
 CONF = HERE.parent / "tmux.conf"
 STATE = ("NEEDS_FILE", "NEEDS_CACHE", "GEN_DIR")
 # the lines a scene takes from tmux.conf: the bar, the pane border, the clicks
-LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status-left|status-left-length|status-right|"
+LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status|status-position|status-format\[\d\]|"
+                   r"status-left|status-left-length|status-right|"
                    r"status-right-length|@click_label|@title_role) |bind -n MouseDown1Status )")
 LIVE = re.compile(r"^@(thm_|catppuccin_|cap_|click_label|title_role|lucas|fleet)")
 LIVE_STYLES = ("status-style", "pane-border-style", "pane-active-border-style", "window-status-format",

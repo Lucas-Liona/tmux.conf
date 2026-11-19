@@ -28,7 +28,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 CONF = HERE.parent / "tmux.conf"
 GEN = os.environ.get("GEN_BIN", str(Path.home() / ".local/bin/gen"))
-LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status-right) |bind -n MouseDown1Status )")
+LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status|status-format\[\d\]|status-right) |bind -n MouseDown1Status )")
 
 
 class Guard(unittest.TestCase):
@@ -156,10 +156,10 @@ class Border(unittest.TestCase):
         self.tmux(self.inner, "send-keys", "-t", left, "gen bump resume >/dev/null; clear", "Enter")
         self.wait_for(lambda: self.tmux(self.inner, "show-options", "-pqv", "-t", left, "@gen"), lambda: "no @gen yet")
         value = self.tmux(self.inner, "show-options", "-pqv", "-t", left, "@gen")
-        last = self.screen()[-1]
-        at = re.search(rf"(?<![0-9]){value} ", last)
+        last = self.screen()[-2]  # the bar's first line: no status-position here, so the bar is at the bottom
+        at = re.search(rf"(?<![0-9]){value}(?: |$)", last)
         self.assertIsNotNone(at, f"{value} not on the status line: {last!r}")
-        col, row = at.start() + 1, len(self.screen())
+        col, row = at.start() + 1, len(self.screen()) - 1
         time.sleep(0.35)
         for button, down in ((35, True), (0, True), (0, False)):
             self.tmux(self.outer, "send-keys", "-t", "terminal:", "-l", f"\033[<{button};{col};{row}{'M' if down else 'm'}")

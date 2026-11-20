@@ -29,7 +29,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 CONF = HERE.parent / "tmux.conf"
 NEEDS = os.environ.get("NEEDS_BIN", str(Path.home() / ".local/bin/needs"))
-LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status|status-format\[\d\]|status-left) |bind -n MouseDown1Status )")
+LINES = re.compile(r"^(set -g (mouse|pane-border-format|pane-border-status|status|status-format\[\d\]|status-left|status-right) |bind -n MouseDown1Status )")
 LEFT, MOVE = 0, 35
 # What Claude Code's trust dialog leaves at the bottom of a pane (live, main:3.2, 2026-11-17 08:4x)
 TRUST = ["Quick safety check: Is this a project you created or one you trust?", "❯ No, exit",
@@ -162,10 +162,10 @@ class Badge(unittest.TestCase):
             time.sleep(0.05)
 
     def badge(self):
-        """The badge, on the bar's first line: the second-last row here (no status-position, so the bar is at the bottom)."""
+        """The clickable badge, on the bar: its one line is the last row (2026-11-20: the bar went to the bottom)."""
         rows = self.screen()
-        self.assertIn("! ", rows[-2])
-        return rows[-2].index("! ") + 2, len(rows) - 1
+        self.assertIn("! ", rows[-1])
+        return rows[-1].index("! ") + 2, len(rows)
 
     def dialog(self, lines=TRUST, then=()):
         """A pane in a session of its own that ends in a dialog; its pane id."""
@@ -216,11 +216,12 @@ class Badge(unittest.TestCase):
         self.assertNotIn("! ", self.screen()[0])  # the border keeps its row (gen is on it) but loses the badge
         self.assertEqual(self.needs().stdout.strip(), "nothing waits on you")
 
-    def test_the_badge_is_on_the_bar_not_the_border_and_it_opens_the_list(self):
-        """Lucas, 2026-11-18, needs 49: "A": with the bar on top, the border copy of the badge went."""
+    def test_the_badge_shows_on_the_border_and_clicks_on_the_bar(self):
+        """Lucas, 2026-11-20, "Status in border": the status half went to the top border, which takes no clicks in
+        3.4, so the badge shows there and a second copy on the bar at the bottom is the one that opens the list."""
         self.needs("add", "a decision only Lucas makes")
         self.wait_for("! 1")
-        self.assertFalse(any("! 1" in row for row in self.screen() if row.lstrip().startswith("─")), self.screen()[:2])
+        self.assertIn("! 1", self.screen()[0])
         self.click("! 1", self.badge())
         self.wait_for("a decision only Lucas makes")
 

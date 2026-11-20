@@ -108,12 +108,12 @@ class Restore(unittest.TestCase):
 
 
 
-class Top(unittest.TestCase):
-    """Lucas, 2026-11-18: "when will status move to top?". With his config the bar is the first row, the pane
-    border line the third (2026-11-19: the badge's line first, the windows' and the ⌘'s second), and the ⌘ menu
-    still opens on screen when clicked."""
+class Layout(unittest.TestCase):
+    """Lucas, 2026-11-18: "when will status move to top?"; 2026-11-20: "put this on the bottom!!! keep the status on
+    the top" and "Status in border". With his config the pane border is the first row and shows the badge, the bar
+    is the last row, and the ⌘ menu still opens on screen when clicked."""
 
-    def test_the_bar_is_on_top_above_the_border_and_its_menu_opens(self):
+    def test_the_border_is_on_top_the_bar_at_the_bottom_and_its_menu_opens(self):
         s = scene.Scene()
         self.addCleanup(s.close)
         conf = s.dir / "tmux.conf"
@@ -123,20 +123,20 @@ class Top(unittest.TestCase):
             s.run("needs", "add", f"scene ask {n}", capture_output=True)
         time.sleep(1.5)
         rows = s.screen().split("\n")
-        self.assertIn("⌘", rows[1], f"row 1 is not the bar's second line: {rows[1]!r} (last row: {rows[-1]!r})")
-        self.assertTrue(rows[2].lstrip().startswith("─"), f"row 2 is not the border: {rows[2]!r}")
-        self.assertTrue(rows[0].lstrip().startswith("! 3"), rows[0])  # the badge: on the bar, top left, once
-        self.assertNotIn("! 3", rows[1] + rows[2])  # not again below (Lucas, needs 49: "A")
-        col = rows[1].index("⌘") + 1
+        self.assertIn("⌘", rows[-1], f"the last row is not the bar: {rows[-1]!r}")
+        self.assertIn("─", rows[0], f"row 0 is not the border: {rows[0]!r}")
+        self.assertIn("! 3", rows[0])  # the badge shows on the border, top left (2026-11-20, "Status in border")
+        self.assertIn("! 3", rows[-1])  # and clicks on the bar
+        col = rows[-1].index("⌘") + 1
         time.sleep(0.35)
         for button, down in ((35, True), (0, True), (0, False)):
-            s.outer_tmux("send-keys", "-t", "terminal:", "-l", f"\033[<{button};{col};2{'M' if down else 'm'}")
+            s.outer_tmux("send-keys", "-t", "terminal:", "-l", f"\033[<{button};{col};{len(rows)}{'M' if down else 'm'}")
             time.sleep(0.05)
         end, menu = time.monotonic() + 6, ""
         while time.monotonic() < end and "panel" not in menu:
             time.sleep(0.1)
             menu = s.screen()
-        self.assertIn("panel", menu, "the ⌘ menu did not open from the top bar")
+        self.assertIn("panel", menu, "the ⌘ menu did not open from the bar")
         self.assertIn("aq", menu)  # the menu's rows are on screen, not cut off above the top
 
 

@@ -95,7 +95,7 @@ class Click(unittest.TestCase):
         cls.work.mkdir()
         lines = [line.replace("~/.config/tmux/scripts/", f"{HERE}/")
                  for line in CONF.read_text().splitlines() if LINES.match(line)]
-        assert len(lines) == 10, lines  # with status 2 and both status-format lines
+        assert len(lines) == 8, lines  # one bar line since 2026-11-20: status on, no status-format lines
         conf = tmp / "click.conf"
         # escape-time as on the live server: at tmux's 500 ms a lone Escape swallows the mouse bytes after it
         conf.write_text("\n".join(lines + ['set -g @thm_mauve "#c6a0f6"', "set -s escape-time 20"]) + "\n")
@@ -285,27 +285,8 @@ class Click(unittest.TestCase):
         self.keys("Escape")
         self.tmux(self.inner, "select-window", "-t", self.pane)
 
-    def test_the_last_session_beside_it_is_a_button_too(self):
-        """A left click on "⇄ name" goes there, and the same spot then leads back."""
-        client = self.tmux(self.inner, "list-clients", "-F", "#{client_name}")
-        session = lambda: self.tmux(self.inner, "list-clients", "-F", "#{client_session}")
-        self.tmux(self.inner, "new-session", "-d", "-s", "elsewhere", "cat")
-        try:
-            self.assertIsNone(self.where("⇄"))  # no last session yet: nothing drawn
-            self.tmux(self.inner, "switch-client", "-c", client, "-t", "elsewhere")
-            self.tmux(self.inner, "switch-client", "-c", client, "-t", "riverboat")
-            for there, back in (("elsewhere", "riverboat"), ("riverboat", "elsewhere")):
-                self.wait_for(f"⇄ {there}")
-                self.click(f"⇄ {there}")
-                self.wait_for(f"⇄ {back}")
-                self.assertEqual(session(), there)
-            self.click("⇄ elsewhere", RIGHT)  # not the editor: the bar's stock menu, as anywhere else
-            self.wait_for("Swap Left")
-            self.keys("Escape")
-            self.assertEqual(session(), "riverboat")
-        finally:
-            self.tmux(self.inner, "switch-client", "-c", client, "-t", "riverboat")
-            self.tmux(self.inner, "kill-session", "-t", "=elsewhere")
+    # 2026-11-20: "⇄ last session" left the bar for the pane border ("Status in border"), which takes no clicks
+    # in tmux 3.4, so its click test was removed with that choice. prefix Tab still flips sessions.
 
     def test_binding_twice_wraps_once(self):
         before = self.tmux(self.inner, "list-keys", "-T", "root", "MouseDown3Status")
@@ -332,7 +313,7 @@ class Folder(unittest.TestCase):
         s.tmux("set-option", "-p", "-t", "lucas2:", "@skill_badge", "time-budget playwright collect +10")
         end, row = time.monotonic() + 8, ""
         while time.monotonic() < end:
-            row = s.screen().split("\n")[1].rstrip()  # the bar's second line, under the badge's
+            row = s.screen().split("\n")[-1].rstrip()  # the bar: one line, the last row (2026-11-20)
             if re.search(r"lucas[^A-Za-z0-9]*$", row):  # the folder pill ends in its cap glyph
                 break
             time.sleep(0.2)

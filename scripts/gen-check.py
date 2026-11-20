@@ -150,25 +150,9 @@ class Border(unittest.TestCase):
                       lambda: f"border row: {self.screen()[0]!r}")
 
 
-    def test_clicking_the_number_on_the_status_bar_opens_the_ring_around_it(self):
-        left = self.tmux(self.inner, "list-panes", "-t", "work:two", "-F", "#{pane_id}").split("\n")[0]
-        self.tmux(self.inner, "select-pane", "-t", left)
-        self.tmux(self.inner, "send-keys", "-t", left, "gen bump resume >/dev/null; clear", "Enter")
-        self.wait_for(lambda: self.tmux(self.inner, "show-options", "-pqv", "-t", left, "@gen"), lambda: "no @gen yet")
-        value = self.tmux(self.inner, "show-options", "-pqv", "-t", left, "@gen")
-        last = self.screen()[-2]  # the bar's first line: no status-position here, so the bar is at the bottom
-        at = re.search(rf"(?<![0-9]){value}(?: |$)", last)
-        self.assertIsNotNone(at, f"{value} not on the status line: {last!r}")
-        col, row = at.start() + 1, len(self.screen()) - 1
-        time.sleep(0.35)
-        for button, down in ((35, True), (0, True), (0, False)):
-            self.tmux(self.outer, "send-keys", "-t", "terminal:", "-l", f"\033[<{button};{col};{row}{'M' if down else 'm'}")
-            time.sleep(0.05)
-        self.wait_for(lambda: any(line.lstrip("│ ").startswith(f"▶{int(value):>6}") for line in self.screen()),
-                      lambda: f"no ring popup marking {value}")
-        self.tmux(self.outer, "send-keys", "-t", "terminal:", "q")  # less ends, the popup closes: the throwaway client only
-        self.wait_for(lambda: not any("▶" in line for line in self.screen()), lambda: "the popup is still open")
-        self.assertEqual(self.tmux(self.inner, "display-message", "-p", "-t", left, "#{pane_in_mode}"), "0")  # no "returned 1" view
+    # 2026-11-20: the number left the status bar ("Status in border": Lucas chose the status half in the pane
+    # border, which takes no clicks in tmux 3.4), so the ring popup no longer opens from a click. `gen ring` still
+    # prints it. The test that clicked it was removed with that choice.
 
 
 if __name__ == "__main__":

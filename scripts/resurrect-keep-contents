@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Keep a copy of tmux-resurrect's pane contents from every save, so scrollback lost to a `clear` can come back.
+
+    resurrect-keep-contents save                      @resurrect-hook-post-save-all, after the sidebar stripper
+    resurrect-keep-contents list                      the kept copies, newest first
+    resurrect-keep-contents show <session:win.pane> [--at YYYY-mm-ddTHH:MM]
+                                                      that pane's history from the newest copy at or before --at
+
+resurrect writes one pane_contents.tar.gz and overwrites it every save (continuum: every 5 minutes), so a pane
+cleared at 06:2x was already empty in the 06:30 archive (taps, 2026-11-20). Copies go to <resurrect dir>/kept/:
+every one from the last 2 hours, the newest per hour to 48 hours, the newest per day to 14 days. A copy is
+about 3 MB, so the whole is about 250 MB. A save hook must never fail a save: `save` always exits 0.
+"""
+import argparse
+import os
+import shutil
+import sys
+import tarfile
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DIR = Path(os.environ.get("RESURRECT_DIR", Path.home() / ".local/share/tmux/resurrect"))
+KEPT = DIR / "kept"
+FORMAT = "pane_contents-%Y%m%dT%H%M%S.tar.gz"
+ALL_FOR, HOURLY_FOR, DAILY_FOR = timedelta(hours=2), timedelta(hours=48), timedelta(days=14)
+
+
+def now():
+    fixed = os.environ.get("KEEP_NOW")  # tests only
+    return datetime.fromisoformat(fixed) if fixed else datetime.now()
+
+
+def copies():
+    """(time, path), newest first."""
+    found = []
+    for path in KEPT.glob("pane_contents-*.tar.gz"):
+        try:
+            found.append((datetime.strptime(path.name, FORMAT), path))
+        except ValueError:
+            continue
+    return sorted(found, reverse=True)
+
+
+def prune(at):
+    seen = set()
+    for when, path in copies():
+        age = at - when
+        if age <= ALL_FOR:
+            continue
+        bucket = when.strftime("%Y%m%d%H") if age <= HOURLY_FOR else when.strftime("%Y%m%d")
+        if age > DAILY_FOR or bucket in seen:
+            path.unlink()
+        seen.add(bucket)
+
+
+def save():
+    source = DIR / "pane_contents.tar.gz"
+    if not source.exists():
+        return 0
+    at = now()
+    KEPT.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, KEPT / at.strftime(FORMAT))
+    prune(at)
+    return 0
+
+
+def show(target, at):
+    for when, path in copies():
+        if at and when > at:
+            continue
+        with tarfile.open(path) as tar:
+            try:
+                member = tar.extractfile(f"./pane_contents/pane-{target}")
+            except KeyError:
+                continue
+            sys.stdout.write(f"# {target} as saved {when:%Y-%m-%d %H:%M:%S} ({path})\n")
+            sys.stdout.write(member.read().decode(errors="replace"))
+            return 0
+    print(f"resurrect-keep-contents: no kept copy holds pane {target}" + (f" at or before {at}" if at else ""),
+          file=sys.stderr)
+    return 1
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="resurrect-keep-contents")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("save")
+    sub.add_parser("list")
+    s = sub.add_parser("show")
+    s.add_argument("target", help="session:window.pane, as resurrect names it (taps:1.1)")
+    s.add_argument("--at", type=datetime.fromisoformat)
+    a = ap.parse_args(argv)
+    if a.cmd == "save":
+        try:
+            return save()
+        except Exception as exc:  # never fail resurrect's save
+            print(f"resurrect-keep-contents: {exc}", file=sys.stderr)
+            return 0
+    if a.cmd == "list":
+        for when, path in copies():
+            print(f"{when:%Y-%m-%d %H:%M:%S}  {path.stat().st_size / 1e6:5.1f} MB  {path}")
+        return 0
+    return show(a.target, a.at)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

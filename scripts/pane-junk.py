@@ -48,6 +48,9 @@ def content(pane: str) -> list[str]:
 
 
 def main() -> int:
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__)  # never the scan: its output is what pane-tour --instant kills
+        return 0
     why = "--why" in sys.argv[1:]
     fmt = "#{window_id}|#{pane_index}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{@workmux_role}|#{session_name}:#{window_index}.#{pane_index}"
     windows = collections.defaultdict(list)

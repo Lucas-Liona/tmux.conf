@@ -12,4 +12,8 @@ last=0
 [ -r "$stamp" ] && read -r last < "$stamp"
 [ $((now - ${last:-0})) -lt "$EVERY" ] && exit 0
 echo "$now" > "$stamp"
+# `set -g @lucas_input off` turns the read off altogether (Lucas, 2026-11-24: "turn off the status bar idle
+# check too"); any other value, or none, and it runs. Asked after the gate, so tmux is asked every EVERY
+# seconds and not on every redraw.
+[ "$(tmux show -gqv @lucas_input 2>/dev/null)" = off ] && exit 0
 "${STATE:-state}" lucas --input > /dev/null 2>&1 &

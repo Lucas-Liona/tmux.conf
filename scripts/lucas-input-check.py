@@ -55,5 +55,28 @@ class Job(unittest.TestCase):
         self.assertFalse(any("not ready" in row for row in drawn))
 
 
+class SwitchedOff(unittest.TestCase):
+    """Lucas, 2026-11-24: "turn off the status bar idle check too". `set -g @lucas_input off` and nothing reads
+    his idle time; any other value, or none, and it runs as before."""
+
+    def test_with_the_option_off_the_job_never_runs_state(self):
+        s = scene.Scene()
+        self.addCleanup(s.close)
+        calls = s.dir / "state-calls.log"
+        stub = s.dir / "state"
+        stub.write_text(f'#!/bin/sh\necho "$(date +%s.%N) $*" >> {calls}\n')
+        stub.chmod(0o755)
+        s.env.update({"STATE": str(stub), "LUCAS_INPUT_EVERY": "1"})
+        s.start("work", "w", "cat", size=(100, 20), lines=LINES, extra=["set -g status-interval 1", "set -g @lucas_input off"])
+        time.sleep(4)
+        self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
+        s.tmux("set", "-g", "@lucas_input", "on")       # and back on, live
+        end = time.monotonic() + 5
+        while time.monotonic() < end and not calls.exists():
+            s.screen()
+            time.sleep(0.2)
+        self.assertTrue(calls.exists(), "switched back on, the job still never ran state")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

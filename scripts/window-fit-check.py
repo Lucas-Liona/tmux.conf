@@ -107,6 +107,49 @@ class Fit(unittest.TestCase):
         row = self.bar_when(lambda r: self.shows_all(r) and len(self.shown_names(r).get(target, "")) > max(others))
         self.assertLessEqual(len(self.shown_names(row)[front]), max(others))
 
+    def test_what_the_front_window_does_not_need_goes_to_its_neighbours_nearest_first(self):
+        # Lucas, 2026-11-24, after seeing 18 unused cells beside 21 bare numbers: "give the spare cells to the
+        # neighbouring windows". A short name in front leaves room; the windows beside it show their names.
+        for n in range(15, 21):
+            self.scene.tmux("new-window", "-d", "-t", "lucas2:", "-n", f"window-name-{n:02}", "cat")
+        idx = self.indexes()
+        self.scene.tmux("select-window", "-t", f"lucas2:{idx[9]}")
+        self.scene.tmux("rename-window", "-t", f"lucas2:{idx[9]}", "ab")
+        self.fit("on", "lucas2")
+
+        def near_beats_far(row, front):
+            names = self.shown_names(row)
+            at = idx.index(front)
+            near = [len(names.get(idx[i], "")) for i in (at - 1, at + 1) if 0 <= i < len(idx)]
+            far = [len(names.get(i, "")) for i in idx if abs(idx.index(i) - at) > 6]
+            return self.shows_all(row) and max(near) > max(far)      # whole names outward from him, until the room is gone
+
+        row = self.bar_when(lambda r: near_beats_far(r, idx[9]))
+        self.assertEqual(self.shown_names(row)[idx[9]], "ab")
+        self.scene.tmux("select-window", "-t", f"lucas2:{idx[2]}")          # the room follows him, by the hook
+        self.scene.tmux("rename-window", "-t", f"lucas2:{idx[2]}", "cd")
+        self.bar_when(lambda r: near_beats_far(r, idx[2]))
+
+    def test_words_instead_of_numbers_when_asked(self):
+        # Lucas, 2026-11-24, of the fitted bar: "I would prefer the words to numbers here? the numbers dont
+        # matter on lucas2". The index goes, and the cells it took go to the names. Remembered per session.
+        self.fit("on", "lucas2")
+        with_numbers = self.shown_names(self.bar_when(self.shows_all))
+        out = self.fit("on", "lucas2", "--words")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        row = self.bar_when(lambda r: not self.shows_all(r) and r.count("win") >= 13)
+        import re
+        windows = re.split(r"\s{3,}", row.strip())[0]                       # the list, without the menu's label
+        for i in self.indexes()[1:]:
+            self.assertNotRegex(windows, rf"(?<![\w-]){i}:")                 # no index left on the bar
+        self.assertEqual(windows.count("win"), 14, row)                     # every window is there, by name
+        second = self.indexes()[1]
+        self.assertGreater(len(max(windows.split(), key=len)), len(with_numbers[second]))
+        self.assertEqual(self.state.read_text(), "lucas2\twords\n")
+        self.fit("on", "lucas2", "--numbers")                               # and back
+        self.bar_when(self.shows_all)
+        self.assertEqual(self.state.read_text(), "lucas2\n")
+
     def test_a_window_with_its_own_format_keeps_it_and_gets_it_back(self):
         second = self.indexes()[1]
         own = self.scene.tmux("show-options", "-gv", "window-status-format") + " BOT"

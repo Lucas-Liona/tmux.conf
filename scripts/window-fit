@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """window-fit: shorten a session's window names until every window is on the bar.
 
-    window-fit on [SESSION]     fit that session (default: the one this runs in), and remember it
+    window-fit on [SESSION] [--words|--numbers]
+                                fit that session (default: the one this runs in), and remember it; --words
+                                drops the window numbers and gives their cells to the names
     window-fit off [SESSION]    put its windows back as they were, and forget it
     window-fit                  refit every remembered session (the hooks in tmux.conf run this)
     window-fit status           which sessions are remembered, and the width each has now
@@ -14,7 +16,8 @@ How: every window of a fitted session gets its own copy of the two window format
 number of cells, the largest number at which the whole list fits between the two ends of the bar. At 0 only the
 numbers are left. When everything fits uncut, the copies are taken away again and the bar is drawn as before.
 The model label after a name (window-models) is dropped while a session is cut, since it is the first thing
-to give up. Whatever cells are left over go to the window in front, which shows more of its name.
+to give up. Whatever cells are left over go to the window in front, which shows more of its name, and then to
+the windows beside it, nearest first.
 
 A window that already had its own copy (workmux stamps agent windows that way, with a status icon) keeps the
 copy, changed in place; the original is kept in the window option @win_fit_was and put back afterwards.
@@ -35,6 +38,7 @@ FORMATS = ("window-status-format", "window-status-current-format")
 LABEL = re.compile(r"#\{\?#\{&&:#\{@claude_model\}.*?\}, · #\{@claude_model\},\}|#\{\?#\{@claude_model\}, · #\{@claude_model\},\}")
 STYLE = re.compile(r"#\[[^\]]*\]")
 NOT_READY = re.compile(r"<'[^']*' not ready>")
+NUMBER = re.compile(r"#I[: ]?")   # the window's index and what joins it to the name
 NONE = "-"          # @win_fit_was for a window that had no copy of its own
 MARGIN = 2          # cells kept free: the list's own "<" and ">" marks take one each when it overflows
 
@@ -50,8 +54,11 @@ def cells(text):
     return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
 
 
-def cut(fmt, width):
-    """A window format with its name cut to `width` cells and the model label gone. None means leave it whole."""
+def cut(fmt, width, words=False):
+    """A window format with its name cut to `width` cells and the model label gone. None means leave it whole.
+    words: the window's number goes too."""
+    if words:
+        fmt = NUMBER.sub("", fmt, count=1)
     if width is None:
         return fmt
     name = f"#{{={width}:window_name}}"
@@ -62,20 +69,24 @@ def cut(fmt, width):
     lead = fmt[:spot]
     if width == 0:
         return lead.rstrip(" ") + rest          # no name: the space before it goes too
+    if words and lead.endswith(" "):
+        lead = lead[:-1]                        # with no number in front, that space is a letter's worth of room
     return lead + name + rest
 
 
 def remembered():
+    """session -> True when it is fitted with words only. One session a line, "name" or "name<TAB>words"."""
     try:
-        return [line.strip() for line in STATE.read_text().splitlines() if line.strip()]
+        rows = [line.split("\t") for line in STATE.read_text().splitlines() if line.strip()]
     except OSError:
-        return []
+        return {}
+    return {row[0].strip(): len(row) > 1 and row[1].strip() == "words" for row in rows}
 
 
 def remember(sessions):
     STATE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE.with_suffix(".tmp")
-    tmp.write_text("".join(s + "\n" for s in dict.fromkeys(sessions)))
+    tmp.write_text("".join(name + ("\twords" if words else "") + "\n" for name, words in sessions.items()))
     tmp.replace(STATE)
 
 
@@ -104,7 +115,7 @@ def room(session):
     return width - ends - MARGIN
 
 
-def fit(session):
+def fit(session, words=False):
     """Choose the width and write it onto every window. Returns the width, or None when nothing is cut."""
     wins = windows(session)
     if not wins:
@@ -118,7 +129,7 @@ def fit(session):
 
     def drawn(window, active, width):
         option = FORMATS[1] if active == "1" else FORMATS[0]
-        return cells(tmux("display-message", "-p", "-t", window, cut(source[window, option], width)))
+        return cells(tmux("display-message", "-p", "-t", window, cut(source[window, option], width, words)))
 
     def total(width):
         return sum(drawn(w, a, width) for w, a, _ in wins) + separator * (len(wins) - 1)
@@ -129,7 +140,7 @@ def fit(session):
         width = None
     else:
         # the widest cut that still fits, found by drawing: what a name costs depends on the format around it
-        low, high = 0, max(cells(name) for _, _, name in wins)
+        low, high = (1 if words else 0), max(cells(name) for _, _, name in wins)   # words: never an empty pill
         while low < high:
             middle = (low + high + 1) // 2
             if total(middle) <= have:
@@ -141,12 +152,32 @@ def fit(session):
     # further). The window in front gets it: every window's CURRENT format is cut more gently, so the room moves
     # with him and no refit is needed when he changes window. One cell is held back for the space a name brings.
     spare = 0 if width is None else max(0, have - total(width) - (1 if width == 0 else 0))
+    # And what the front window's own name does not use goes to the windows beside it, nearest first, left and
+    # right in turn, each taking its whole name or whatever is left (Lucas, 2026-11-24: "give the spare cells to
+    # the neighbouring windows"). That depends on which window is in front, so a hook refits when he moves.
+    beside_width = {window: width for window, _, _ in wins}   # each window's cut when it is not in front
+    if width is not None:
+        order = [window for window, _, _ in wins]
+        at = next((i for i, (_, active, _) in enumerate(wins) if active == "1"), 0)
+        front = order[at]
+        left = have - (total(width) - drawn(front, "1", width) + drawn(front, "1", min(cells(names[front]), width + spare)))
+        beside = [order[i] for step in range(1, len(order)) for i in (at - step, at + step) if 0 <= i < len(order)]
+        for window in beside:
+            if left <= 0:
+                break
+            bare = drawn(window, "0", width)
+            want = cells(names[window])
+            while want > width and drawn(window, "0", want) - bare > left:
+                want -= 1
+            if want > width:
+                beside_width[window] = want
+                left -= drawn(window, "0", want) - bare
     for window, _, _ in wins:
         for option in FORMATS:
             own = tmux("show-options", "-wqv", "-t", window, option)
             was = tmux("show-options", "-wqv", "-t", window, f"@win_fit_was_{option}")
             before = original(window, option)
-            if width is None:
+            if width is None and not words:
                 if was:                           # put back what the window had, or take our copy away
                     if before:
                         tmux("set-option", "-w", "-t", window, option, before)
@@ -156,11 +187,11 @@ def fit(session):
                 continue
             if not was:
                 tmux("set-option", "-w", "-t", window, f"@win_fit_was_{option}", own or NONE)
-            front = min(cells(names[window]), width + spare) if option == FORMATS[1] else width
-            new = cut(before or base[option], front)
+            shown = None if width is None else (min(cells(names[window]), width + spare) if option == FORMATS[1] else beside_width[window])
+            new = cut(before or base[option], shown, words)
             if new != own:
                 tmux("set-option", "-w", "-t", window, option, new)
-    tmux("set-option", "-t", f"={session}:", "@win_fit", "off" if width is None else str(width))
+    tmux("set-option", "-t", f"={session}:", "@win_fit", ("words " if words else "") + ("whole" if width is None else str(width)))
     return width
 
 
@@ -185,30 +216,34 @@ def main(argv):
         return 0
     live = set(tmux("list-sessions", "-F", "#{session_name}").splitlines())
     if command in ("on", "off"):
-        session = argv[1] if len(argv) > 1 else tmux("display-message", "-p", "#{session_name}")
+        named = [a for a in argv[1:] if not a.startswith("--")]
+        session = named[0] if named else tmux("display-message", "-p", "#{session_name}")
         if session not in live:
             print(f"window-fit: no session named {session!r}", file=sys.stderr)
             return 2
         if command == "on":
-            remember([*remembered(), session])
-            width = fit(session)
-            print(f"{session}: " + ("everything fits uncut" if width is None else f"names cut to {width}" if width else "numbers only"))
+            sessions = remembered()
+            sessions[session] = "--words" in argv or (sessions.get(session, False) and "--numbers" not in argv)
+            remember(sessions)
+            width = fit(session, sessions[session])
+            print(f"{session}: " + ("words only, " if sessions[session] else "")
+                  + ("everything fits uncut" if width is None else f"names cut to {width}" if width else "numbers only"))
         else:
-            remember([s for s in remembered() if s != session])
+            remember({s: w for s, w in remembered().items() if s != session})
             unfit(session)
             print(f"{session}: back as it was")
         return 0
     if command == "status":
-        for session in remembered():
+        for session, words in remembered().items():
             state = tmux("show-options", "-qv", "-t", f"={session}:", "@win_fit") if session in live else "not running"
             print(f"{session}\t{state or 'not fitted yet'}")
         return 0
     if command:
         print(f"window-fit: unknown command {command!r} (on, off, status, or nothing to refit)", file=sys.stderr)
         return 2
-    for session in remembered():
+    for session, words in remembered().items():
         if session in live:
-            fit(session)
+            fit(session, words)
     return 0
 
 

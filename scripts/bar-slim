@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""bar-slim: take the session pill, the red count and the folder pill off one session's bottom bar.
+
+    bar-slim on [SESSION]     slim that session's bar (default: the one this runs in), and remember it
+    bar-slim off [SESSION]    give it the full bar back, and forget it
+    bar-slim                  slim every remembered session again (tmux.conf runs this when a session appears)
+    bar-slim status           the remembered sessions
+
+Lucas, 2026-11-24, with two screenshots of lucas2's bar: "dont need these ... except menu. on lucas2 prefferred
+but it should be settable per session". What stays: the windows, the menu button, and the jobs the bar starts
+(needs, window-models, continuum's save), which print nothing but must keep running. The red count is still on
+the top line.
+
+status-left and status-right are session options, so the slim bar is this session's own copy of the global
+strings with those three pieces cut out. tmux forgets session options over a restart, so the remembered
+sessions live in ~/.local/state/tmux/bar-slim.sessions (BAR_SLIM_STATE overrides it, for checking).
+"""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+STATE = Path(os.environ.get("BAR_SLIM_STATE") or Path.home() / ".local/state/tmux/bar-slim.sessions")
+SESSION_PILL = "#{E:@catppuccin_status_session}"
+FOLDER_PILL = "#{E:@catppuccin_status_directory}"
+NEEDS_START = "#{?#{e|>:#{@needs_count},0},"
+
+
+def tmux(*argv):
+    out = subprocess.run(["tmux", *argv], capture_output=True, text=True)
+    return out.stdout.rstrip("\n") if out.returncode == 0 else ""
+
+
+def without_needs(text):
+    """Cut the `#{?count > 0, badge ,}` conditional out, by matching its braces."""
+    start = text.find(NEEDS_START)
+    if start < 0:
+        return text
+    depth, i = 0, start
+    while i < len(text):
+        if text.startswith("#{", i):
+            depth += 1
+            i += 2
+            continue
+        if text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[:start] + text[i + 1:]
+        i += 1
+    return text
+
+
+def slim(left, right):
+    left = left.replace(SESSION_PILL + " ", "").replace(SESSION_PILL, "")
+    return left, without_needs(right).replace(FOLDER_PILL, "")
+
+
+def remembered():
+    try:
+        return [line.strip() for line in STATE.read_text().splitlines() if line.strip()]
+    except OSError:
+        return []
+
+
+def remember(sessions):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text("".join(s + "\n" for s in dict.fromkeys(sessions)))
+    tmp.replace(STATE)
+
+
+def apply(session):
+    left, right = slim(tmux("show-options", "-gv", "status-left"), tmux("show-options", "-gv", "status-right"))
+    tmux("set-option", "-t", f"={session}:", "status-left", left)
+    tmux("set-option", "-t", f"={session}:", "status-right", right)
+
+
+def main(argv):
+    command = argv[0] if argv else ""
+    if command in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    live = set(tmux("list-sessions", "-F", "#{session_name}").splitlines())
+    if command in ("on", "off"):
+        session = argv[1] if len(argv) > 1 else tmux("display-message", "-p", "#{session_name}")
+        if session not in live:
+            print(f"bar-slim: no session named {session!r}", file=sys.stderr)
+            return 2
+        if command == "on":
+            remember([*remembered(), session])
+            apply(session)
+            print(f"{session}: slim bar")
+        else:
+            remember([s for s in remembered() if s != session])
+            tmux("set-option", "-u", "-t", f"={session}:", "status-left")
+            tmux("set-option", "-u", "-t", f"={session}:", "status-right")
+            print(f"{session}: full bar")
+        return 0
+    if command == "status":
+        print("\n".join(remembered()) or "no session is slimmed")
+        return 0
+    if command:
+        print(f"bar-slim: unknown command {command!r} (on, off, status, or nothing to apply again)", file=sys.stderr)
+        return 2
+    for session in remembered():
+        if session in live:
+            apply(session)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""window-fit: shorten a session's window names until every window is on the bar.
+
+    window-fit on [SESSION]     fit that session (default: the one this runs in), and remember it
+    window-fit off [SESSION]    put its windows back as they were, and forget it
+    window-fit                  refit every remembered session (the hooks in tmux.conf run this)
+    window-fit status           which sessions are remembered, and the width each has now
+
+Lucas, 2026-11-24, of lucas2's 21 windows where the bar showed ten and a ">": "can we make the middle folders
+on lucas2 shrink to fit the number of windows onto bar? it can adjust on creation deletion modification. if tmux
+doesnt store window state we should".
+
+How: every window of a fitted session gets its own copy of the two window formats with `#W` cut to the same
+number of cells, the largest number at which the whole list fits between the two ends of the bar. At 0 only the
+numbers are left. When everything fits uncut, the copies are taken away again and the bar is drawn as before.
+The model label after a name (window-models) is dropped while a session is cut, since it is the first thing
+to give up. Whatever cells are left over go to the window in front, which shows more of its name.
+
+A window that already had its own copy (workmux stamps agent windows that way, with a status icon) keeps the
+copy, changed in place; the original is kept in the window option @win_fit_was and put back afterwards.
+
+tmux keeps none of this over a restart, so the remembered sessions live in a file:
+~/.local/state/tmux/window-fit.sessions (WINDOW_FIT_STATE overrides it, for checking).
+"""
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+STATE = Path(os.environ.get("WINDOW_FIT_STATE") or Path.home() / ".local/state/tmux/window-fit.sessions")
+FORMATS = ("window-status-format", "window-status-current-format")
+# window-models' label, as tmux.conf writes it after " #W"; matched loosely so its expiry number may change
+LABEL = re.compile(r"#\{\?#\{&&:#\{@claude_model\}.*?\}, · #\{@claude_model\},\}|#\{\?#\{@claude_model\}, · #\{@claude_model\},\}")
+STYLE = re.compile(r"#\[[^\]]*\]")
+NOT_READY = re.compile(r"<'[^']*' not ready>")
+NONE = "-"          # @win_fit_was for a window that had no copy of its own
+MARGIN = 2          # cells kept free: the list's own "<" and ">" marks take one each when it overflows
+
+
+def tmux(*argv):
+    out = subprocess.run(["tmux", *argv], capture_output=True, text=True)
+    return out.stdout.rstrip("\n") if out.returncode == 0 else ""
+
+
+def cells(text):
+    """How wide a drawn string is: styles gone, wide characters counted as two."""
+    text = NOT_READY.sub("", STYLE.sub("", text))
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def cut(fmt, width):
+    """A window format with its name cut to `width` cells and the model label gone. None means leave it whole."""
+    if width is None:
+        return fmt
+    name = f"#{{={width}:window_name}}"
+    spot = fmt.find("#W")
+    if spot < 0:
+        return fmt
+    rest = LABEL.sub("", fmt[spot + 2:], count=1) if LABEL.match(fmt[spot + 2:]) else fmt[spot + 2:]
+    lead = fmt[:spot]
+    if width == 0:
+        return lead.rstrip(" ") + rest          # no name: the space before it goes too
+    return lead + name + rest
+
+
+def remembered():
+    try:
+        return [line.strip() for line in STATE.read_text().splitlines() if line.strip()]
+    except OSError:
+        return []
+
+
+def remember(sessions):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text("".join(s + "\n" for s in dict.fromkeys(sessions)))
+    tmp.replace(STATE)
+
+
+def windows(session):
+    rows = tmux("list-windows", "-t", f"={session}:", "-F", "#{window_id}\t#{window_active}\t#{window_name}")
+    return [row.split("\t", 2) for row in rows.splitlines() if row.count("\t") == 2]
+
+
+def original(window, option):
+    """The window's own copy of a format before window-fit touched it, or "" when it had none."""
+    was = tmux("show-options", "-wqv", "-t", window, f"@win_fit_was_{option}")
+    if was:
+        return "" if was == NONE else was
+    return tmux("show-options", "-wqv", "-t", window, option)
+
+
+def room(session):
+    """Cells the window list may use: the client's width less the two ends of the bar."""
+    widths = [int(w) for w in tmux("list-clients", "-t", f"={session}:", "-F", "#{client_width}").split() if w.isdigit()]
+    width = min(widths) if widths else int(tmux("display-message", "-p", "-t", f"={session}:", "#{window_width}") or 0)
+    ends = 0
+    for side in ("left", "right"):
+        drawn = cells(tmux("display-message", "-p", "-t", f"={session}:", f"#{{E:status-{side}}}"))
+        limit = int(tmux("show-options", "-gv", f"status-{side}-length") or 0)
+        ends += min(drawn, limit) if limit else drawn
+    return width - ends - MARGIN
+
+
+def fit(session):
+    """Choose the width and write it onto every window. Returns the width, or None when nothing is cut."""
+    wins = windows(session)
+    if not wins:
+        return None
+    separator = cells(tmux("show-options", "-gv", "window-status-separator")) if len(wins) > 1 else 0
+    base = {option: tmux("show-options", "-gv", option) for option in FORMATS}
+    source = {}                                   # (window, option) -> the format to start from
+    for window, active, _ in wins:
+        for option in FORMATS:
+            source[window, option] = original(window, option) or base[option]
+
+    def drawn(window, active, width):
+        option = FORMATS[1] if active == "1" else FORMATS[0]
+        return cells(tmux("display-message", "-p", "-t", window, cut(source[window, option], width)))
+
+    def total(width):
+        return sum(drawn(w, a, width) for w, a, _ in wins) + separator * (len(wins) - 1)
+
+    have = room(session)
+    names = {window: name for window, _, name in wins}
+    if total(None) <= have:
+        width = None
+    else:
+        # the widest cut that still fits, found by drawing: what a name costs depends on the format around it
+        low, high = 0, max(cells(name) for _, _, name in wins)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if total(middle) <= have:
+                low = middle
+            else:
+                high = middle - 1
+        width = low                               # 0 when even the bare numbers do not fit: tmux then scrolls the list
+    # What is left over after the uniform cut is too little for a letter each (or nothing would have been cut
+    # further). The window in front gets it: every window's CURRENT format is cut more gently, so the room moves
+    # with him and no refit is needed when he changes window. One cell is held back for the space a name brings.
+    spare = 0 if width is None else max(0, have - total(width) - (1 if width == 0 else 0))
+    for window, _, _ in wins:
+        for option in FORMATS:
+            own = tmux("show-options", "-wqv", "-t", window, option)
+            was = tmux("show-options", "-wqv", "-t", window, f"@win_fit_was_{option}")
+            before = original(window, option)
+            if width is None:
+                if was:                           # put back what the window had, or take our copy away
+                    if before:
+                        tmux("set-option", "-w", "-t", window, option, before)
+                    else:
+                        tmux("set-option", "-wu", "-t", window, option)
+                    tmux("set-option", "-wu", "-t", window, f"@win_fit_was_{option}")
+                continue
+            if not was:
+                tmux("set-option", "-w", "-t", window, f"@win_fit_was_{option}", own or NONE)
+            front = min(cells(names[window]), width + spare) if option == FORMATS[1] else width
+            new = cut(before or base[option], front)
+            if new != own:
+                tmux("set-option", "-w", "-t", window, option, new)
+    tmux("set-option", "-t", f"={session}:", "@win_fit", "off" if width is None else str(width))
+    return width
+
+
+def unfit(session):
+    for window, _, _ in windows(session):
+        for option in FORMATS:
+            was = tmux("show-options", "-wqv", "-t", window, f"@win_fit_was_{option}")
+            if not was:
+                continue
+            if was == NONE:
+                tmux("set-option", "-wu", "-t", window, option)
+            else:
+                tmux("set-option", "-w", "-t", window, option, was)
+            tmux("set-option", "-wu", "-t", window, f"@win_fit_was_{option}")
+    tmux("set-option", "-u", "-t", f"={session}:", "@win_fit")
+
+
+def main(argv):
+    command = argv[0] if argv else ""
+    if command in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    live = set(tmux("list-sessions", "-F", "#{session_name}").splitlines())
+    if command in ("on", "off"):
+        session = argv[1] if len(argv) > 1 else tmux("display-message", "-p", "#{session_name}")
+        if session not in live:
+            print(f"window-fit: no session named {session!r}", file=sys.stderr)
+            return 2
+        if command == "on":
+            remember([*remembered(), session])
+            width = fit(session)
+            print(f"{session}: " + ("everything fits uncut" if width is None else f"names cut to {width}" if width else "numbers only"))
+        else:
+            remember([s for s in remembered() if s != session])
+            unfit(session)
+            print(f"{session}: back as it was")
+        return 0
+    if command == "status":
+        for session in remembered():
+            state = tmux("show-options", "-qv", "-t", f"={session}:", "@win_fit") if session in live else "not running"
+            print(f"{session}\t{state or 'not fitted yet'}")
+        return 0
+    if command:
+        print(f"window-fit: unknown command {command!r} (on, off, status, or nothing to refit)", file=sys.stderr)
+        return 2
+    for session in remembered():
+        if session in live:
+            fit(session)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

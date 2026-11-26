@@ -508,7 +508,7 @@ def main(pane_id, pane_pid, pane_path, session_id, client):
     stem.with_suffix(".launch.values.json").write_text(json.dumps(p))  # read by handoff-buffer.lua
     stem.with_suffix(".launch.json").write_text(json.dumps({
         "dir": pane_path, "session": session_id, "client": client, "transcript": str(exported),
-        "old_pid": info.get("pid") if info else None,
+        "pane": pane_id, "old_pid": info.get("pid") if info else None,
         "written_ns": buffer.stat().st_mtime_ns}))  # launch() reads it: only a buffer written since then launches
     # nvim lives in /opt, which only the interactive shell puts on PATH; the popup runs with the server's.
     nvim = shutil.which("nvim") or "/opt/nvim-linux64/bin/nvim"
@@ -641,8 +641,13 @@ def launch(buffer):
         except OSError as e:
             return say(ctx["client"], f"handoff: not launched; could not make {where}: {e.strerror}")
         quiet += ["-n", Path(where).name]
+    # A press opens just right of the window it was pressed in, and the ones after it move up: "so you can
+    # delete the old one if needed and it just naturally takes its place" (Lucas, 2026-11-25). A branch, or a
+    # press whose pane has since closed, goes to the end of the session as before.
+    its_window = dict(line.split() for line in tmux("list-panes", "-a", "-F", "#{pane_id} #{window_id}").splitlines())
+    beside = [] if branched or ctx.get("pane") not in its_window else ["-a", "-t", its_window[ctx["pane"]]]
     made = subprocess.run(["tmux", "new-window", *quiet, "-P", "-F", "#{pane_id} #{session_name}:#{window_index}",
-                           "-t", ctx["session"], "-c", where,
+                           *(beside or ["-t", ctx["session"]]), "-c", where,
                            "-e", f"PATH={bin_on_path(argv[0])['PATH']}", "zsh", "-c", WRAPPER, *argv],
                           capture_output=True, text=True)
     if made.returncode:  # printed too: the popup (-EE) stays open on a non-zero exit

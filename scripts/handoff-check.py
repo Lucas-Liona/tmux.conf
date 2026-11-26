@@ -554,6 +554,39 @@ class Window(unittest.TestCase):
         self.assertTrue(alive, "the window closed with its claude")
         self.assertEqual(shell, b"zsh\0", "the pane's process is the shell the wrapper was to become")
 
+    def test_a_press_opens_its_window_just_right_of_the_one_it_was_pressed_in(self):
+        """Lucas, 2026-11-25, when a press in window 1 opened window 15: "I think prefix T should always go to
+        the immediate right of where you are, so you can delete the old one if needed and it just naturally
+        takes its place." """
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            s.tmux("new-window", "-d", "-t", "pin", "-n", "second")
+            s.tmux("new-window", "-d", "-t", "pin", "-n", "third")
+            buf = s.pressed()
+            pressed_in = s.tmux("list-panes", "-t", "pin:0", "-F", "#{pane_id}")
+            recorded = json.loads(buf.with_name(buf.name.replace(".launch.md", ".launch.json")).read_text()).get("pane")
+            time.sleep(0.05)
+            buf.write_text(buf.read_text())              # his :wq: only a buffer written since the press launches
+            s.launch(buf)
+            names = s.tmux("list-windows", "-t", "pin", "-F", "#{window_index} #{window_name}").splitlines()
+        self.assertEqual(recorded, pressed_in, "the press writes down which pane it came from")
+        self.assertEqual(len(names), 4)
+        self.assertEqual(names[2:], ["2 second", "3 third"], "the new window is at 1 and the others moved up")
+
+    def test_a_press_whose_pane_has_closed_still_launches_at_the_end(self):
+        with Server() as s:
+            project = s.dir / "pin"
+            project.mkdir()
+            s.tmux("new-window", "-d", "-t", "pin", "-n", "second")
+            buf = s.buffer(default_buffer(str(project)), project)
+            context = s.dir / "pin.launch.json"
+            context.write_text(json.dumps({**json.loads(context.read_text()), "pane": "%999"}))
+            s.launch(buf)
+            names = s.tmux("list-windows", "-t", "pin", "-F", "#{window_name}").splitlines()
+        self.assertEqual(len(names), 3)
+        self.assertEqual(names[1], "second")
+
 
 class Branch(unittest.TestCase):
     """handoff.py --branch: an agent hands over its own pane, with a file where the popup would be."""
